@@ -1,0 +1,33 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Deployment artifacts
+deploy.sh
