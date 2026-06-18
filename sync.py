@@ -533,6 +533,7 @@ class SyncOrchestrator:
         - Deactivates partners not in Close smart view (except platform admins)
         - Re-activates partners that return to the smart view (except platform admins)
         - Reports new partners (cannot auto-add - require user accounts)
+        - Updates paid_partner based on funded deals in dealsheet_sync_v2
         
         Returns:
             SyncStats with counts
@@ -561,10 +562,10 @@ class SyncOrchestrator:
             close_partner_map = {p["name"].lower().strip(): p for p in close_partners}
             logger.info(f"Found {len(close_partners)} active partners in Close")
             
-            # 2. Fetch all partners from Supabase
+            # 2. Fetch all partners from Supabase (excluding soft-deleted)
             result = self.supabase.client.table("partners").select(
                 "uuid, partner_name, is_active, lead_id, is_platform_admin"
-            ).execute()
+            ).eq("is_deleted", False).execute()
             db_partners = result.data or []
             logger.info(f"Found {len(db_partners)} partners in database")
             
@@ -685,6 +686,47 @@ class SyncOrchestrator:
                     logger.info(f"Successfully inserted {stats.inserted} new partners")
                 if stats.skipped > 0:
                     logger.warning(f"Skipped {stats.skipped} partners due to errors")
+            
+            # 7. Update paid_partner status based on dealsheet funding data
+            logger.info("=== Updating paid_partner status from dealsheet data ===")
+            try:
+                funded_partner_uuids = self.supabase.get_funded_partner_uuids()
+                
+                # Refresh db_partners list to include any newly inserted partners
+                current_partners = self.supabase.client.table("partners").select(
+                    "uuid, partner_name, paid_partner, is_platform_admin"
+                ).eq("is_deleted", False).execute()
+                
+                paid_updated = 0
+                for partner in current_partners.data or []:
+                    uuid = partner["uuid"]
+                    current_paid = partner.get("paid_partner")
+                    should_be_paid = uuid in funded_partner_uuids
+                    
+                    # Skip platform admin partners for paid_partner logic
+                    if partner.get("is_platform_admin"):
+                        continue
+                    
+                    # Only update if status changed
+                    if current_paid != should_be_paid:
+                        self.supabase.client.table("partners").update({
+                            "paid_partner": should_be_paid
+                        }).eq("uuid", uuid).execute()
+                        paid_updated += 1
+                        logger.debug(
+                            f"Updated paid_partner for '{partner['partner_name']}': "
+                            f"{current_paid} → {should_be_paid}"
+                        )
+                
+                if paid_updated > 0:
+                    logger.info(f"Updated paid_partner for {paid_updated} partners based on dealsheet data")
+                    stats.updated += paid_updated
+                else:
+                    logger.info("No paid_partner changes needed")
+                    
+            except Exception as e:
+                logger.error(f"Failed to update paid_partner status: {e}")
+                stats.add_error(f"paid_partner update failed: {str(e)}")
             
             # Update sync run
             self.supabase.update_sync_run(

@@ -258,8 +258,79 @@ class SupabaseClient:
 
     def get_all_partners(self) -> list[dict]:
         """Fetch all active partners for fuzzy matching."""
-        result = self.client.table("partners").select("uuid, partner_name").eq("is_active", True).execute()
+        result = self.client.table("partners").select("uuid, partner_name").eq("is_active", True).eq("is_deleted", False).execute()
         return result.data or []
+
+    def get_funded_partner_uuids(self) -> set[str]:
+        """
+        Get partner UUIDs that have at least one funded enquiry in dealsheet_sync_v2.
+        
+        A partner is considered "funded" if they have at least one dealsheet row linked via:
+        - Direct: dealsheet.lead_id → leads.id → leads.partner_id
+        - Indirect: dealsheet.partner_introducer matches partner_name (fuzzy via PartnerMatcher)
+        
+        Returns:
+            Set of partner UUIDs (as strings) that have funded deals
+        """
+        funded_partner_uuids = set()
+        
+        # Path 1: Direct link via lead_id → partner_id
+        # Get all dealsheets with lead_id set
+        dealsheets_with_leads = self.client.table("dealsheet_sync_v2").select(
+            "lead_id"
+        ).eq("is_deleted", False).not_.is_("lead_id", "null").execute()
+        
+        if dealsheets_with_leads.data:
+            lead_ids = list({ds["lead_id"] for ds in dealsheets_with_leads.data if ds.get("lead_id")})
+            
+            if lead_ids:
+                # Fetch leads with those IDs and get their partner_id
+                # Split into batches to avoid URL length limits (Supabase REST API)
+                batch_size = 100
+                for i in range(0, len(lead_ids), batch_size):
+                    batch = lead_ids[i:i + batch_size]
+                    leads_result = self.client.table("leads").select(
+                        "partner_id"
+                    ).in_("id", batch).eq("is_deleted", False).not_.is_("partner_id", "null").execute()
+                    
+                    if leads_result.data:
+                        funded_partner_uuids.update(
+                            lead["partner_id"] for lead in leads_result.data if lead.get("partner_id")
+                        )
+        
+        logger.info(f"Found {len(funded_partner_uuids)} funded partners via direct lead_id link")
+        
+        # Path 2: Indirect link via partner_introducer name matching
+        # Get all dealsheets with partner_introducer set
+        dealsheets_with_introducer = self.client.table("dealsheet_sync_v2").select(
+            "partner_introducer"
+        ).eq("is_deleted", False).not_.is_("partner_introducer", "null").execute()
+        
+        if dealsheets_with_introducer.data:
+            # Get all partners for fuzzy matching
+            all_partners = self.client.table("partners").select(
+                "uuid, partner_name"
+            ).eq("is_deleted", False).execute()
+            
+            if all_partners.data:
+                # Build a map of normalized partner names to UUIDs for matching
+                from partner_matcher import PartnerMatcher
+                matcher = PartnerMatcher(all_partners.data)
+                
+                introducer_names = {
+                    ds["partner_introducer"] 
+                    for ds in dealsheets_with_introducer.data 
+                    if ds.get("partner_introducer") and ds["partner_introducer"].strip()
+                }
+                
+                for name in introducer_names:
+                    partner_uuid = matcher.match(name)
+                    if partner_uuid:
+                        funded_partner_uuids.add(partner_uuid)
+        
+        logger.info(f"Total {len(funded_partner_uuids)} funded partners after name matching")
+        
+        return funded_partner_uuids
 
     def get_custom_activity_uuid(self, custom_activity_id: str) -> Optional[str]:
         """Look up the internal UUID for a custom activity by its Close ID."""

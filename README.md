@@ -6,7 +6,7 @@ A Python worker that syncs Close CRM leads and activities to Supabase on a recur
 
 - **Incremental sync** — polls for changes every few minutes using watermarks
 - **Full re-sync** — complete refresh daily
-- **Partner sync** — activates/deactivates partners based on Close status
+- **Partner sync** — activates/deactivates partners based on Close status; auto-sets `paid_partner` from dealsheet funding
 - **Idempotent upserts** — safe to retry, no duplicate data
 - **Advisory locking** — prevents concurrent sync runs
 - **Partner fuzzy matching** — resolves partner names to UUIDs
@@ -171,7 +171,7 @@ python main.py --phase partners --debug
 | Phase | What it does |
 |-------|--------------|
 | `all` (default) | partners → leads → lead_magnets → activities |
-| `partners` | Sync partner active/inactive status from Close |
+| `partners` | Sync partner active/inactive status from Close + set `paid_partner` based on dealsheet funding |
 | `leads` | Sync leads from Lead Source smart view |
 | `lead_magnets` | Sync LeadMaggy activities per lead |
 | `activities` | Sync partner referrals and uploads |
