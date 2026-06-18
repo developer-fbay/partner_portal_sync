@@ -30,11 +30,24 @@ class PartnerMatcher:
         self.partner_names = list(self.partner_map.keys())
         self.threshold = Config.PARTNER_MATCH_THRESHOLD
         
-        # Build normalized name map for faster lookups
-        self._normalized_map = {}
+        # Build normalized name map; prefer active partner on collision
+        self._partner_by_name = {p["partner_name"]: p for p in partners}
+        self._normalized_map: dict[str, str] = {}
         for name in self.partner_names:
             normalized = self._normalize(name)
-            self._normalized_map[normalized] = name
+            existing_name = self._normalized_map.get(normalized)
+            if existing_name is None:
+                self._normalized_map[normalized] = name
+                continue
+            existing = self._partner_by_name.get(existing_name, {})
+            current = self._partner_by_name.get(name, {})
+            if current.get("is_active") and not existing.get("is_active"):
+                self._normalized_map[normalized] = name
+            elif (
+                current.get("is_active") == existing.get("is_active")
+                and len(name) > len(existing_name)
+            ):
+                self._normalized_map[normalized] = name
         
         logger.info(f"PartnerMatcher initialized with {len(partners)} partners, threshold={self.threshold}")
 
@@ -111,24 +124,39 @@ class PartnerMatcher:
         if not self.partner_names:
             return None
         
-        result = process.extractOne(
+        normalized_choices = [self._normalize(n) for n in self.partner_names]
+        results = process.extract(
             normalized_input,
-            [self._normalize(n) for n in self.partner_names],
+            normalized_choices,
             scorer=fuzz.token_set_ratio,
+            limit=5,
         )
-        
-        if result is None:
+        if not results:
             return None
-        
-        matched_normalized, score, index = result
-        matched_name = self.partner_names[index]
-        
-        if score >= self.threshold:
-            logger.debug(f"Fuzzy match: '{partner_name}' -> '{matched_name}' (score={score})")
-            return self.partner_map[matched_name]
-        
-        logger.debug(f"No match for '{partner_name}' (best: '{matched_name}' score={score} < threshold={self.threshold})")
-        return None
+
+        best_score = results[0][1]
+        candidates = [
+            self.partner_names[idx]
+            for _, score, idx in results
+            if score >= self.threshold and score >= best_score - 1
+        ]
+        if not candidates:
+            matched_name = self.partner_names[results[0][2]]
+            score = results[0][1]
+            logger.debug(
+                f"No match for '{partner_name}' (best: '{matched_name}' score={score} "
+                f"< threshold={self.threshold})"
+            )
+            return None
+
+        matched_name = max(
+            candidates,
+            key=lambda n: (self._partner_by_name.get(n, {}).get("is_active", False), len(n)),
+        )
+
+        score = results[0][1]
+        logger.debug(f"Fuzzy match: '{partner_name}' -> '{matched_name}' (score={score})")
+        return self.partner_map[matched_name]
 
     def match_from_lead(self, lead: dict) -> tuple[Optional[str], Optional[str]]:
         """

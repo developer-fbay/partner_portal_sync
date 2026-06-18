@@ -1,6 +1,7 @@
 """Supabase client with upserts, watermarks, and advisory locking."""
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -13,6 +14,40 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 ADVISORY_LOCK_ID = 1  # Global lock ID shared by all sync modes
+_COMMISSION_ZERO = frozenset({"0", "0.0", "0.00", "£0", "£0.00"})
+_DEALSHEET_PAGE_SIZE = 1000
+_LEAD_PAGE_SIZE = 1000
+
+
+def _parse_commission_amount(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in _COMMISSION_ZERO:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _has_partner_commission(value: Any) -> bool:
+    amount = _parse_commission_amount(value)
+    return amount is not None and amount > 0
+
+
+def _normalize_entity_name(name: str) -> str:
+    if not name:
+        return ""
+    text = name.lower()
+    suffixes = [" ltd", " limited", " plc", " llp", " inc", " llc", " corp", " corporation"]
+    for suffix in suffixes:
+        if text.endswith(suffix):
+            text = text[:-len(suffix)]
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text)).strip()
 
 
 class SupabaseClient:
@@ -258,78 +293,155 @@ class SupabaseClient:
 
     def get_all_partners(self) -> list[dict]:
         """Fetch all active partners for fuzzy matching."""
-        result = self.client.table("partners").select("uuid, partner_name").eq("is_active", True).eq("is_deleted", False).execute()
+        result = self.client.table("partners").select(
+            "uuid, partner_name, is_active"
+        ).eq("is_active", True).eq("is_deleted", False).execute()
         return result.data or []
+
+    def _paginate_rows(self, table: str, columns: str, page_size: int, apply_filters=None):
+        """Yield all rows from a table using PostgREST range pagination."""
+        offset = 0
+        while True:
+            query = self.client.table(table).select(columns)
+            if apply_filters:
+                query = apply_filters(query)
+            result = query.range(offset, offset + page_size - 1).execute()
+            batch = result.data or []
+            yield from batch
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+    def _build_lead_partner_lookups(self) -> tuple[dict, dict, dict]:
+        """
+        Build lead lookup maps for paid-partner dealsheet linking.
+
+        Returns:
+            (lead_id -> partner_id, close_lead_id -> partner_id, normalized_name -> partner_id)
+        """
+        lead_by_id: dict[str, str] = {}
+        lead_by_close_id: dict[str, str] = {}
+        lead_by_normalized_name: dict[str, str] = {}
+
+        def lead_filters(query):
+            return query.eq("is_deleted", False).not_.is_("partner_id", "null")
+
+        for lead in self._paginate_rows(
+            "leads",
+            "id, close_lead_id, lead_name, display_name, partner_id",
+            _LEAD_PAGE_SIZE,
+            lead_filters,
+        ):
+            partner_id = lead.get("partner_id")
+            if not partner_id:
+                continue
+
+            lead_id = lead.get("id")
+            if lead_id:
+                lead_by_id[str(lead_id)] = partner_id
+
+            close_lead_id = (lead.get("close_lead_id") or "").strip()
+            if close_lead_id:
+                lead_by_close_id[close_lead_id] = partner_id
+
+            for name_field in ("lead_name", "display_name"):
+                normalized = _normalize_entity_name(lead.get(name_field) or "")
+                if normalized:
+                    lead_by_normalized_name[normalized] = partner_id
+
+        return lead_by_id, lead_by_close_id, lead_by_normalized_name
 
     def get_funded_partner_uuids(self) -> set[str]:
         """
-        Get partner UUIDs that have at least one funded enquiry in dealsheet_sync_v2.
-        
-        A partner is considered "funded" if they have at least one dealsheet row linked via:
-        - Direct: dealsheet.lead_id → leads.id → leads.partner_id
-        - Indirect: dealsheet.partner_introducer matches partner_name (fuzzy via PartnerMatcher)
-        
+        Get partner UUIDs that qualify as paid partners from dealsheet_sync_v2.
+
+        A dealsheet row counts only when partner_comms_total_amount is present and > 0.
+        The row is linked to a partner via any of:
+        - dealsheet.lead_id -> leads.partner_id
+        - dealsheet.close_lead_id -> leads.close_lead_id -> leads.partner_id
+        - dealsheet.partner_introducer matched to partner_name (fuzzy; active partners preferred)
+        - dealsheet.company matched to lead lead_name/display_name -> leads.partner_id
+
         Returns:
-            Set of partner UUIDs (as strings) that have funded deals
+            Set of partner UUIDs (as strings) that should have paid_partner = true
         """
-        funded_partner_uuids = set()
-        
-        # Path 1: Direct link via lead_id → partner_id
-        # Get all dealsheets with lead_id set
-        dealsheets_with_leads = self.client.table("dealsheet_sync_v2").select(
-            "lead_id"
-        ).eq("is_deleted", False).not_.is_("lead_id", "null").execute()
-        
-        if dealsheets_with_leads.data:
-            lead_ids = list({ds["lead_id"] for ds in dealsheets_with_leads.data if ds.get("lead_id")})
-            
-            if lead_ids:
-                # Fetch leads with those IDs and get their partner_id
-                # Split into batches to avoid URL length limits (Supabase REST API)
-                batch_size = 100
-                for i in range(0, len(lead_ids), batch_size):
-                    batch = lead_ids[i:i + batch_size]
-                    leads_result = self.client.table("leads").select(
-                        "partner_id"
-                    ).in_("id", batch).eq("is_deleted", False).not_.is_("partner_id", "null").execute()
-                    
-                    if leads_result.data:
-                        funded_partner_uuids.update(
-                            lead["partner_id"] for lead in leads_result.data if lead.get("partner_id")
-                        )
-        
-        logger.info(f"Found {len(funded_partner_uuids)} funded partners via direct lead_id link")
-        
-        # Path 2: Indirect link via partner_introducer name matching
-        # Get all dealsheets with partner_introducer set
-        dealsheets_with_introducer = self.client.table("dealsheet_sync_v2").select(
-            "partner_introducer"
-        ).eq("is_deleted", False).not_.is_("partner_introducer", "null").execute()
-        
-        if dealsheets_with_introducer.data:
-            # Get all partners for fuzzy matching
-            all_partners = self.client.table("partners").select(
-                "uuid, partner_name"
-            ).eq("is_deleted", False).execute()
-            
-            if all_partners.data:
-                # Build a map of normalized partner names to UUIDs for matching
-                from partner_matcher import PartnerMatcher
-                matcher = PartnerMatcher(all_partners.data)
-                
-                introducer_names = {
-                    ds["partner_introducer"] 
-                    for ds in dealsheets_with_introducer.data 
-                    if ds.get("partner_introducer") and ds["partner_introducer"].strip()
-                }
-                
-                for name in introducer_names:
-                    partner_uuid = matcher.match(name)
-                    if partner_uuid:
-                        funded_partner_uuids.add(partner_uuid)
-        
-        logger.info(f"Total {len(funded_partner_uuids)} funded partners after name matching")
-        
+        from partner_matcher import PartnerMatcher
+
+        funded_partner_uuids: set[str] = set()
+        link_counts = {
+            "lead_id": 0,
+            "close_lead_id": 0,
+            "introducer": 0,
+            "company_name": 0,
+        }
+
+        all_partners = self.client.table("partners").select(
+            "uuid, partner_name, is_active"
+        ).eq("is_deleted", False).execute()
+        partner_rows = all_partners.data or []
+        active_partners = [p for p in partner_rows if p.get("is_active")]
+        matcher = PartnerMatcher(active_partners or partner_rows)
+
+        lead_by_id, lead_by_close_id, lead_by_normalized_name = self._build_lead_partner_lookups()
+
+        commission_row_count = 0
+
+        def dealsheet_filters(query):
+            return query.eq("is_deleted", False)
+
+        for ds in self._paginate_rows(
+            "dealsheet_sync_v2",
+            "lead_id, close_lead_id, partner_introducer, company, partner_comms_total_amount",
+            _DEALSHEET_PAGE_SIZE,
+            dealsheet_filters,
+        ):
+            if not _has_partner_commission(ds.get("partner_comms_total_amount")):
+                continue
+
+            commission_row_count += 1
+            row_linked = False
+
+            lead_id = ds.get("lead_id")
+            if lead_id:
+                partner_id = lead_by_id.get(str(lead_id))
+                if partner_id:
+                    funded_partner_uuids.add(partner_id)
+                    link_counts["lead_id"] += 1
+                    row_linked = True
+
+            close_lead_id = (ds.get("close_lead_id") or "").strip()
+            if close_lead_id:
+                partner_id = lead_by_close_id.get(close_lead_id)
+                if partner_id:
+                    funded_partner_uuids.add(partner_id)
+                    if not row_linked:
+                        link_counts["close_lead_id"] += 1
+                    row_linked = True
+
+            introducer = ds.get("partner_introducer")
+            if introducer and str(introducer).strip():
+                partner_id = matcher.match(introducer)
+                if partner_id:
+                    funded_partner_uuids.add(partner_id)
+                    if not row_linked:
+                        link_counts["introducer"] += 1
+                    row_linked = True
+
+            company = ds.get("company")
+            if company and str(company).strip():
+                partner_id = lead_by_normalized_name.get(_normalize_entity_name(company))
+                if partner_id:
+                    funded_partner_uuids.add(partner_id)
+                    if not row_linked:
+                        link_counts["company_name"] += 1
+
+        logger.info(
+            f"Paid partner scan: {commission_row_count} commission dealsheet rows, "
+            f"{len(funded_partner_uuids)} partners linked "
+            f"(lead_id={link_counts['lead_id']}, close_lead_id={link_counts['close_lead_id']}, "
+            f"introducer={link_counts['introducer']}, company_name={link_counts['company_name']})"
+        )
+
         return funded_partner_uuids
 
     def get_custom_activity_uuid(self, custom_activity_id: str) -> Optional[str]:

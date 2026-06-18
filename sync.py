@@ -533,7 +533,8 @@ class SyncOrchestrator:
         - Deactivates partners not in Close smart view (except platform admins)
         - Re-activates partners that return to the smart view (except platform admins)
         - Reports new partners (cannot auto-add - require user accounts)
-        - Updates paid_partner based on funded deals in dealsheet_sync_v2
+        - Updates paid_partner when dealsheet rows have partner_comms_total_amount > 0
+          (linked via lead_id, close_lead_id, partner_introducer, or company/lead name)
         
         Returns:
             SyncStats with counts
