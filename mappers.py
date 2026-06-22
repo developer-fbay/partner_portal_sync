@@ -803,7 +803,11 @@ SHEET_DATE_COLUMNS = {"date", "contract_end_date"}
 
 
 def _parse_sheet_date(value: str) -> Optional[str]:
-    """Parse a sheet date cell to ISO format (YYYY-MM-DD) for Postgres."""
+    """Parse a sheet date cell to ISO format (YYYY-MM-DD) for Postgres.
+
+    The dealsheet uses US month/day/year. US formats are tried before UK/EU
+    day/month formats so ambiguous values like 03/05/2025 resolve as March 5.
+    """
     if not value:
         return None
     value = str(value).strip()
@@ -822,7 +826,14 @@ def _parse_sheet_date(value: str) -> Optional[str]:
             except (ValueError, OverflowError):
                 pass
 
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%Y"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+    ):
         try:
             return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
         except ValueError:

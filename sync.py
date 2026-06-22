@@ -29,6 +29,12 @@ from mappers import (
     deterministic_uuid,
 )
 from config import Config
+from change_logger import (
+    log_partner_change,
+    log_lead_changes,
+    log_custom_activity_changes,
+    log_dealsheet_sync_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,68 @@ class SyncOrchestrator:
             partners = self.supabase.get_all_partners()
             self.partner_matcher = PartnerMatcher(partners)
 
+    def _get_existing_close_lead_ids(self, close_lead_ids: list[str]) -> set[str]:
+        """Return close_lead_id values that already exist in the leads table."""
+        if not close_lead_ids:
+            return set()
+        result = (
+            self.supabase.client.table("leads")
+            .select("close_lead_id")
+            .in_("close_lead_id", close_lead_ids)
+            .execute()
+        )
+        return {row["close_lead_id"] for row in (result.data or [])}
+
+    def _build_lead_change_logs(
+        self,
+        batch: list[dict],
+        existing_close_lead_ids: set[str],
+    ) -> list[dict]:
+        """Build change log entries for a batch of upserted leads."""
+        if not batch:
+            return []
+
+        close_lead_ids = [lead["close_lead_id"] for lead in batch]
+        result = (
+            self.supabase.client.table("leads")
+            .select("id, close_lead_id, partner_id")
+            .in_("close_lead_id", close_lead_ids)
+            .execute()
+        )
+        batch_by_close_id = {lead["close_lead_id"]: lead for lead in batch}
+
+        logs = []
+        for row in result.data or []:
+            close_id = row["close_lead_id"]
+            action = "INSERT" if close_id not in existing_close_lead_ids else "UPDATE"
+            logs.append({
+                "lead_id": row["id"],
+                "partner_id": row.get("partner_id"),
+                "action": action,
+                "changed_by": "close_sync",
+                "before_data": None,
+                "after_data": batch_by_close_id.get(close_id),
+                "raw_payload": None,
+            })
+        return logs
+
+    def _upsert_leads_batch_with_logging(self, batch: list[dict]) -> tuple[int, int]:
+        """Deduplicate, upsert, and log changes for a leads batch."""
+        seen = {}
+        for lead in batch:
+            seen[lead["close_lead_id"]] = lead
+        deduped_batch = list(seen.values())
+
+        existing_close_lead_ids = self._get_existing_close_lead_ids(
+            [lead["close_lead_id"] for lead in deduped_batch]
+        )
+        inserted, updated = self.supabase.upsert_leads(deduped_batch)
+        log_lead_changes(
+            self.supabase,
+            self._build_lead_change_logs(deduped_batch, existing_close_lead_ids),
+        )
+        return inserted, updated
+
     # -------------------------------------------------------------------------
     # Leads Sync
     # -------------------------------------------------------------------------
@@ -175,13 +243,7 @@ class SyncOrchestrator:
                     
                     # Upsert in batches (deduplicate by close_lead_id first)
                     if len(batch) >= batch_size:
-                        # Deduplicate batch - keep last occurrence (most recent data)
-                        seen = {}
-                        for lead in batch:
-                            seen[lead["close_lead_id"]] = lead
-                        deduped_batch = list(seen.values())
-                        
-                        inserted, updated = self.supabase.upsert_leads(deduped_batch)
+                        inserted, updated = self._upsert_leads_batch_with_logging(batch)
                         stats.inserted += inserted
                         stats.updated += updated
                         batch = []
@@ -192,13 +254,7 @@ class SyncOrchestrator:
             
             # Upsert remaining batch (deduplicate by close_lead_id first)
             if batch:
-                # Deduplicate batch - keep last occurrence (most recent data)
-                seen = {}
-                for lead in batch:
-                    seen[lead["close_lead_id"]] = lead
-                batch = list(seen.values())
-                
-                inserted, updated = self.supabase.upsert_leads(batch)
+                inserted, updated = self._upsert_leads_batch_with_logging(batch)
                 stats.inserted += inserted
                 stats.updated += updated
             
@@ -274,6 +330,8 @@ class SyncOrchestrator:
         )
         
         try:
+            activity_change_logs = []
+
             # For LeadMaggy, we need to iterate through leads and fetch their latest activity
             # In incremental mode, we only process leads updated since watermark
             for lead in self.close.get_leads_from_smart_view(
@@ -302,10 +360,21 @@ class SyncOrchestrator:
                     # First upsert to custom_activities to get/create UUID
                     custom_activity_mapped = map_custom_activity(activity, partner_id)
                     self.supabase.upsert_custom_activities([custom_activity_mapped])
-                    
+
                     # Get the UUID
                     custom_activity_uuid = self.supabase.get_custom_activity_uuid(activity.get("id"))
-                    
+
+                    if custom_activity_uuid:
+                        activity_change_logs.append({
+                            "activity_id": custom_activity_uuid,
+                            "partner_id": partner_id,
+                            "action": "UPSERT",
+                            "changed_by": "close_sync",
+                            "before_data": None,
+                            "after_data": custom_activity_mapped,
+                            "raw_payload": activity,
+                        })
+
                     if not custom_activity_uuid:
                         stats.add_error(f"Could not get UUID for activity {activity.get('id')}")
                         continue
@@ -319,7 +388,9 @@ class SyncOrchestrator:
                 except Exception as e:
                     stats.add_error(f"Lead {lead_id} LeadMaggy: {str(e)}")
                     logger.error(f"Error processing LeadMaggy for lead {lead_id}: {e}")
-            
+
+            log_custom_activity_changes(self.supabase, activity_change_logs)
+
             # Update watermark on success
             self.supabase.update_watermark("lead_magnet", run_started_at)
             
@@ -399,6 +470,7 @@ class SyncOrchestrator:
             # Store batches: (custom_activity_mapped, original_activity) tuples
             pending_activities = []
             batch_size = 100
+            activity_change_logs = []
             
             # Track activities we've already seen (to avoid duplicates)
             seen_activity_ids = set()
@@ -414,7 +486,21 @@ class SyncOrchestrator:
                 # First, upsert all to custom_activities
                 custom_activity_records = [item[0] for item in batch]
                 self.supabase.upsert_custom_activities(custom_activity_records)
-                
+
+                for custom_mapped, original_activity in batch:
+                    close_id = original_activity.get("id")
+                    uuid = self.supabase.get_custom_activity_uuid(close_id)
+                    if uuid:
+                        activity_change_logs.append({
+                            "activity_id": uuid,
+                            "partner_id": custom_mapped.get("partner_id"),
+                            "action": "UPSERT",
+                            "changed_by": "close_sync",
+                            "before_data": None,
+                            "after_data": custom_mapped,
+                            "raw_payload": original_activity,
+                        })
+
                 # Now route to specific tables
                 referral_records = []
                 upload_records = []
@@ -494,7 +580,9 @@ class SyncOrchestrator:
                 inserted, updated = flush_batch(pending_activities)
                 stats.inserted += inserted
                 stats.updated += updated
-            
+
+            log_custom_activity_changes(self.supabase, activity_change_logs)
+
             # Update watermark
             self.supabase.update_watermark("activities", run_started_at)
             
@@ -621,6 +709,7 @@ class SyncOrchestrator:
             for update in to_update:
                 uuid = update.pop("uuid")
                 self.supabase.client.table("partners").update(update).eq("uuid", uuid).execute()
+                log_partner_change(self.supabase, uuid, "UPDATE", after_data=update)
                 stats.updated += 1
             
             if to_update:
@@ -631,6 +720,12 @@ class SyncOrchestrator:
                 self.supabase.client.table("partners").update({
                     "is_active": False,
                 }).eq("uuid", p["uuid"]).execute()
+                log_partner_change(
+                    self.supabase,
+                    p["uuid"],
+                    "DEACTIVATE",
+                    after_data={"is_active": False},
+                )
                 stats.updated += 1
                 logger.debug(f"Deactivated: {p['name']}")
             
@@ -679,6 +774,20 @@ class SyncOrchestrator:
                         
                         if self.supabase.insert_partner(partner_data):
                             stats.inserted += 1
+                            partner_result = (
+                                self.supabase.client.table("partners")
+                                .select("uuid")
+                                .eq("slug", slug)
+                                .limit(1)
+                                .execute()
+                            )
+                            if partner_result.data:
+                                log_partner_change(
+                                    self.supabase,
+                                    partner_result.data[0]["uuid"],
+                                    "INSERT",
+                                    after_data=partner_data,
+                                )
                         else:
                             stats.add_error(f"Failed to insert partner '{partner_name}'")
                             stats.skipped += 1
@@ -879,6 +988,14 @@ class SyncOrchestrator:
                 pruned = self.supabase.prune_dealsheet_orphans(active_uuids)
                 if pruned:
                     logger.info(f"Dealsheet: removed {pruned} rows not in current sheet")
+
+            log_dealsheet_sync_event(self.supabase, {
+                "fetched": stats.fetched,
+                "inserted": stats.inserted,
+                "updated": stats.updated,
+                "skipped": stats.skipped,
+                "errors": stats.errors,
+            })
 
             self.supabase.update_watermark("dealsheet", run_started_at)
 
