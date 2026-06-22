@@ -338,16 +338,39 @@ class SupabaseClient:
 
         Returns (dealsheet_rows_cleared, stub_leads_deleted).
         """
-        cleared = 0
-        pending_uuids: list[str] = []
+        stub_lead_ids: list[str] = []
+        stub_close_ids: list[str] = []
 
+        for lead in self._paginate_rows(
+            "leads",
+            "id, close_lead_id",
+            _LEAD_PAGE_SIZE,
+            lambda q: q.like("close_lead_id", "dealsheet_%"),
+        ):
+            lead_id = str(lead.get("id") or "").strip()
+            close_lead_id = (lead.get("close_lead_id") or "").strip()
+            if lead_id:
+                stub_lead_ids.append(lead_id)
+            if close_lead_id:
+                stub_close_ids.append(close_lead_id)
+
+        cleared = 0
+
+        for i in range(0, len(stub_lead_ids), 500):
+            chunk = stub_lead_ids[i : i + 500]
+            self.client.table("dealsheet_sync_v2").update(
+                {"lead_id": None, "close_lead_id": None}
+            ).in_("lead_id", chunk).execute()
+            cleared += len(chunk)
+
+        pending_uuids: list[str] = []
         for ds in self._paginate_rows(
             "dealsheet_sync_v2",
             "dealsheet_uuid, close_lead_id",
             _DEALSHEET_PAGE_SIZE,
         ):
             close_lead_id = (ds.get("close_lead_id") or "").strip()
-            if not close_lead_id.startswith("dealsheet_"):
+            if close_lead_id not in stub_close_ids:
                 continue
             pending_uuids.append(ds["dealsheet_uuid"])
             if len(pending_uuids) >= 500:
@@ -363,20 +386,9 @@ class SupabaseClient:
             ).in_("dealsheet_uuid", pending_uuids).execute()
             cleared += len(pending_uuids)
 
-        stub_ids: list[str] = []
-        for lead in self._paginate_rows(
-            "leads",
-            "close_lead_id",
-            _LEAD_PAGE_SIZE,
-            lambda q: q.like("close_lead_id", "dealsheet_%"),
-        ):
-            close_lead_id = (lead.get("close_lead_id") or "").strip()
-            if close_lead_id:
-                stub_ids.append(close_lead_id)
-
         deleted = 0
-        for i in range(0, len(stub_ids), 500):
-            chunk = stub_ids[i : i + 500]
+        for i in range(0, len(stub_close_ids), 500):
+            chunk = stub_close_ids[i : i + 500]
             self.client.table("leads").delete().in_("close_lead_id", chunk).execute()
             deleted += len(chunk)
 
