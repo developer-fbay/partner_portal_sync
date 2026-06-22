@@ -10,7 +10,7 @@ import psycopg2
 from supabase import create_client, Client
 
 from config import Config
-from mappers import normalize_company, deterministic_uuid
+from mappers import normalize_company
 from lead_matcher import LeadMatcher, normalize_entity_name
 
 logger = logging.getLogger(__name__)
@@ -300,9 +300,13 @@ class SupabaseClient:
             _LEAD_PAGE_SIZE,
             lead_filters,
         ):
+            close_lead_id = (lead.get("close_lead_id") or "").strip()
+            if close_lead_id.startswith("dealsheet_"):
+                continue
+
             record = {
                 "id": str(lead["id"]),
-                "close_lead_id": (lead.get("close_lead_id") or "").strip() or None,
+                "close_lead_id": close_lead_id or None,
             }
             for name_field in ("lead_name", "display_name"):
                 raw = lead.get(name_field) or ""
@@ -328,49 +332,60 @@ class SupabaseClient:
         row["close_lead_id"] = None
         return False
 
-    def ensure_dealsheet_leads(self, companies: list[str], matcher: LeadMatcher) -> int:
+    def purge_dealsheet_stub_leads(self) -> tuple[int, int]:
         """
-        Create minimal lead records for dealsheet companies with no existing lead match.
+        Remove synthetic dealsheet placeholder leads and unlink dealsheet rows.
 
-        Uses a stable synthetic close_lead_id so re-runs are idempotent.
+        Returns (dealsheet_rows_cleared, stub_leads_deleted).
         """
-        stubs = []
-        seen: set[str] = set()
+        cleared = 0
+        pending_uuids: list[str] = []
 
-        for company in companies:
-            if matcher.match(company):
+        for ds in self._paginate_rows(
+            "dealsheet_sync_v2",
+            "dealsheet_uuid, close_lead_id",
+            _DEALSHEET_PAGE_SIZE,
+        ):
+            close_lead_id = (ds.get("close_lead_id") or "").strip()
+            if not close_lead_id.startswith("dealsheet_"):
                 continue
-            norm = normalize_company(company)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            stubs.append(
-                {
-                    "close_lead_id": f"dealsheet_{deterministic_uuid(norm)}",
-                    "lead_name": company.strip(),
-                    "display_name": company.strip(),
-                    "is_deleted": False,
-                }
+            pending_uuids.append(ds["dealsheet_uuid"])
+            if len(pending_uuids) >= 500:
+                self.client.table("dealsheet_sync_v2").update(
+                    {"lead_id": None, "close_lead_id": None}
+                ).in_("dealsheet_uuid", pending_uuids).execute()
+                cleared += len(pending_uuids)
+                pending_uuids.clear()
+
+        if pending_uuids:
+            self.client.table("dealsheet_sync_v2").update(
+                {"lead_id": None, "close_lead_id": None}
+            ).in_("dealsheet_uuid", pending_uuids).execute()
+            cleared += len(pending_uuids)
+
+        stub_ids: list[str] = []
+        for lead in self._paginate_rows(
+            "leads",
+            "close_lead_id",
+            _LEAD_PAGE_SIZE,
+            lambda q: q.like("close_lead_id", "dealsheet_%"),
+        ):
+            close_lead_id = (lead.get("close_lead_id") or "").strip()
+            if close_lead_id:
+                stub_ids.append(close_lead_id)
+
+        deleted = 0
+        for i in range(0, len(stub_ids), 500):
+            chunk = stub_ids[i : i + 500]
+            self.client.table("leads").delete().in_("close_lead_id", chunk).execute()
+            deleted += len(chunk)
+
+        if cleared or deleted:
+            logger.info(
+                f"Purged dealsheet stubs: cleared {cleared} dealsheet row links, "
+                f"deleted {deleted} stub leads"
             )
-
-        if not stubs:
-            return 0
-
-        created = 0
-        batch_size = 500
-        for i in range(0, len(stubs), batch_size):
-            chunk = stubs[i : i + batch_size]
-            result = self.client.table("leads").upsert(
-                chunk,
-                on_conflict="close_lead_id",
-            ).execute()
-            for lead in result.data or []:
-                matcher.register_lead(lead)
-                created += 1
-
-        matcher.clear_cache()
-        logger.info(f"Ensured {created} dealsheet stub leads for unmatched companies")
-        return created
+        return cleared, deleted
 
     def backfill_dealsheet_lead_ids(self, matcher: LeadMatcher) -> int:
         """Set lead_id on existing dealsheet rows that are still unlinked."""

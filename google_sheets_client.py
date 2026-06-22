@@ -41,7 +41,7 @@ def get_google_access_token() -> str:
         "iat": now,
     }
 
-    key_pem = Config.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY.replace("\\n", "\n")
+    key_pem = Config.get_google_private_key_pem()
     key_data = _parse_pem(key_pem)
     private_key = serialization.load_der_private_key(key_data, password=None)
 

@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+secrets/
 
 # Python bytecode
 __pycache__/

@@ -8,6 +8,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _strip_env_quotes(value: str) -> str:
+    """Strip wrapping quotes Docker env-file may leave on values."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 class Config:
     SUPABASE_URL: str = os.environ["SUPABASE_URL"]
     SUPABASE_SERVICE_ROLE_KEY: str = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -78,6 +86,29 @@ class Config:
 
     # Google Sheets dealsheet sync (required for --phase dealsheet)
     GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "")
+    GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE: str = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE", ""
+    )
     GOOGLE_SERVICE_ACCOUNT_EMAIL: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
     GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
-    GOOGLE_SHEET_RANGE: str = os.getenv("GOOGLE_SHEET_RANGE", "Sheet1!A:AM")
+    GOOGLE_SHEET_RANGE: str = _strip_env_quotes(
+        os.getenv("GOOGLE_SHEET_RANGE", "Sheet1!A:AM")
+    )
+
+    @classmethod
+    def get_google_private_key_pem(cls) -> str:
+        """Load service account PEM from file (preferred for Docker) or env var."""
+        if cls.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE:
+            with open(cls.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE, encoding="utf-8") as f:
+                return f.read()
+        if not cls.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY:
+            raise ValueError(
+                "Set GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE or "
+                "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY for dealsheet sync."
+            )
+        pem = cls.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY.strip()
+        if (pem.startswith('"') and pem.endswith('"')) or (
+            pem.startswith("'") and pem.endswith("'")
+        ):
+            pem = pem[1:-1]
+        return pem.replace("\\n", "\n")

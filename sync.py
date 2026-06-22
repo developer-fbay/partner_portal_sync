@@ -777,18 +777,20 @@ class SyncOrchestrator:
         The table mirrors the current sheet: each row gets a content-based UUID,
         and rows not in the sheet are deleted after a successful upsert.
         """
-        missing = [
-            name
-            for name, value in {
-                "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY": Config.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
-                "GOOGLE_SERVICE_ACCOUNT_EMAIL": Config.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-                "GOOGLE_SHEET_ID": Config.GOOGLE_SHEET_ID,
-            }.items()
-            if not value
-        ]
-        if missing:
+        if not Config.GOOGLE_SERVICE_ACCOUNT_EMAIL or not Config.GOOGLE_SHEET_ID:
+            missing = [
+                name
+                for name, value in {
+                    "GOOGLE_SERVICE_ACCOUNT_EMAIL": Config.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+                    "GOOGLE_SHEET_ID": Config.GOOGLE_SHEET_ID,
+                }.items()
+                if not value
+            ]
+            raise ValueError(f"Missing dealsheet env vars: {', '.join(missing)}")
+        if not Config.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE and not Config.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY:
             raise ValueError(
-                f"Missing dealsheet env vars: {', '.join(missing)}"
+                "Missing dealsheet credential: set GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE "
+                "or GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY"
             )
 
         stats = SyncStats()
@@ -808,26 +810,15 @@ class SyncOrchestrator:
             if raw_rows:
                 headers = raw_rows[0]
                 existing_uuids = self.supabase.get_dealsheet_uuids()
+                cleared, deleted = self.supabase.purge_dealsheet_stub_leads()
+                if cleared or deleted:
+                    logger.info(
+                        f"Dealsheet: purged {deleted} stub leads, "
+                        f"cleared {cleared} dealsheet row links"
+                    )
+
                 leads_by_name = self.supabase.get_leads_by_normalized_name()
                 lead_matcher = LeadMatcher(leads_by_name)
-
-                unique_companies: list[str] = []
-                seen_companies: set[str] = set()
-                for row_values in raw_rows[1:]:
-                    company = (sheet_to_row(headers, row_values).get("company") or "").strip()
-                    key = company.lower()
-                    if company and key not in seen_companies:
-                        seen_companies.add(key)
-                        unique_companies.append(company)
-
-                stub_leads_created = self.supabase.ensure_dealsheet_leads(
-                    unique_companies, lead_matcher
-                )
-                if stub_leads_created:
-                    logger.info(
-                        f"Dealsheet: created {stub_leads_created} stub leads "
-                        f"for companies not found in Close"
-                    )
 
                 rows_by_uuid: dict[str, dict] = {}
                 unlinked_leads = 0
