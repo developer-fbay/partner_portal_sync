@@ -130,8 +130,8 @@ crontab -e
 Add:
 
 ```cron
-# Incremental sync every 5 minutes
-*/5 * * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker >> /var/log/close-sync.log 2>&1
+# Incremental sync every 30 minutes
+*/30 * * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker >> /var/log/close-sync.log 2>&1
 
 # Full re-sync daily at 6:00 AM UTC
 0 6 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --mode full >> /var/log/close-sync.log 2>&1

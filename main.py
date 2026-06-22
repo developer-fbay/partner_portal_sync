@@ -44,8 +44,8 @@ Examples:
     python main.py --phase dealsheet       # Sync Google Sheet dealsheet data
     
 Cron examples:
-    # Incremental every 5 minutes
-    */5 * * * * cd /app && python main.py >> /var/log/close-sync.log 2>&1
+    # Incremental every 30 minutes
+    */30 * * * * cd /app && python main.py >> /var/log/close-sync.log 2>&1
     
     # Full sync daily at 6 AM
     0 6 * * * cd /app && python main.py --mode full >> /var/log/close-sync.log 2>&1
