@@ -10,6 +10,8 @@ import psycopg2
 from supabase import create_client, Client
 
 from config import Config
+from mappers import normalize_company, deterministic_uuid
+from lead_matcher import LeadMatcher, normalize_entity_name
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +42,7 @@ def _has_partner_commission(value: Any) -> bool:
 
 
 def _normalize_entity_name(name: str) -> str:
-    if not name:
-        return ""
-    text = name.lower()
-    suffixes = [" ltd", " limited", " plc", " llp", " inc", " llc", " corp", " corporation"]
-    for suffix in suffixes:
-        if text.endswith(suffix):
-            text = text[:-len(suffix)]
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text)).strip()
+    return normalize_entity_name(name)
 
 
 class SupabaseClient:
@@ -286,6 +281,218 @@ class SupabaseClient:
         
         count = len(result.data) if result.data else 0
         return 0, count
+
+    def get_leads_by_normalized_name(self) -> dict[str, dict]:
+        """
+        Map normalized company/lead names to lead records.
+
+        Indexes both entity-normalized names (strips Ltd etc.) and simple
+        lowercased names so dealsheet company values can match leads.
+        """
+        by_name: dict[str, dict] = {}
+
+        def lead_filters(query):
+            return query.eq("is_deleted", False)
+
+        for lead in self._paginate_rows(
+            "leads",
+            "id, close_lead_id, lead_name, display_name",
+            _LEAD_PAGE_SIZE,
+            lead_filters,
+        ):
+            record = {
+                "id": str(lead["id"]),
+                "close_lead_id": (lead.get("close_lead_id") or "").strip() or None,
+            }
+            for name_field in ("lead_name", "display_name"):
+                raw = lead.get(name_field) or ""
+                for normalized in {
+                    _normalize_entity_name(raw),
+                    normalize_company(raw),
+                }:
+                    if normalized and normalized not in by_name:
+                        by_name[normalized] = record
+
+        logger.info(f"Built lead name lookup with {len(by_name)} normalized names")
+        return by_name
+
+    def attach_lead_to_dealsheet_row(self, row: dict, matcher: LeadMatcher) -> bool:
+        """Set lead_id and close_lead_id from the row company name. Returns True if matched."""
+        lead = matcher.match(row.get("company") or "")
+        if lead:
+            row["lead_id"] = lead["id"]
+            row["close_lead_id"] = lead.get("close_lead_id")
+            return True
+
+        row["lead_id"] = None
+        row["close_lead_id"] = None
+        return False
+
+    def ensure_dealsheet_leads(self, companies: list[str], matcher: LeadMatcher) -> int:
+        """
+        Create minimal lead records for dealsheet companies with no existing lead match.
+
+        Uses a stable synthetic close_lead_id so re-runs are idempotent.
+        """
+        stubs = []
+        seen: set[str] = set()
+
+        for company in companies:
+            if matcher.match(company):
+                continue
+            norm = normalize_company(company)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            stubs.append(
+                {
+                    "close_lead_id": f"dealsheet_{deterministic_uuid(norm)}",
+                    "lead_name": company.strip(),
+                    "display_name": company.strip(),
+                    "is_deleted": False,
+                }
+            )
+
+        if not stubs:
+            return 0
+
+        created = 0
+        batch_size = 500
+        for i in range(0, len(stubs), batch_size):
+            chunk = stubs[i : i + batch_size]
+            result = self.client.table("leads").upsert(
+                chunk,
+                on_conflict="close_lead_id",
+            ).execute()
+            for lead in result.data or []:
+                matcher.register_lead(lead)
+                created += 1
+
+        matcher.clear_cache()
+        logger.info(f"Ensured {created} dealsheet stub leads for unmatched companies")
+        return created
+
+    def backfill_dealsheet_lead_ids(self, matcher: LeadMatcher) -> int:
+        """Set lead_id on existing dealsheet rows that are still unlinked."""
+        updated = 0
+        pending: list[dict] = []
+
+        for ds in self._paginate_rows(
+            "dealsheet_sync_v2",
+            "dealsheet_uuid,company,lead_id",
+            _DEALSHEET_PAGE_SIZE,
+        ):
+            if ds.get("lead_id") or not (ds.get("company") or "").strip():
+                continue
+            row = {"company": ds["company"]}
+            if self.attach_lead_to_dealsheet_row(row, matcher):
+                pending.append(
+                    {
+                        "dealsheet_uuid": ds["dealsheet_uuid"],
+                        "lead_id": row["lead_id"],
+                        "close_lead_id": row.get("close_lead_id"),
+                    }
+                )
+
+            if len(pending) >= 500:
+                self.client.table("dealsheet_sync_v2").upsert(
+                    pending,
+                    on_conflict="dealsheet_uuid",
+                ).execute()
+                updated += len(pending)
+                pending.clear()
+
+        if pending:
+            self.client.table("dealsheet_sync_v2").upsert(
+                pending,
+                on_conflict="dealsheet_uuid",
+            ).execute()
+            updated += len(pending)
+
+        if updated:
+            logger.info(f"Backfilled lead_id on {updated} existing dealsheet rows")
+        return updated
+
+    def get_dealsheet_rows_by_company(self) -> dict[str, list[dict]]:
+        """Group existing dealsheet rows by normalized company name."""
+        by_company: dict[str, list[dict]] = {}
+        for row in self._paginate_rows(
+            "dealsheet_sync_v2",
+            "dealsheet_uuid,company,date",
+            1000,
+        ):
+            company = normalize_company(row.get("company") or "")
+            if company:
+                by_company.setdefault(company, []).append(row)
+        return by_company
+
+    def get_dealsheet_uuids(self) -> set[str]:
+        """Return all dealsheet_uuid values currently in dealsheet_sync_v2."""
+        return {
+            row["dealsheet_uuid"]
+            for row in self._paginate_rows(
+                "dealsheet_sync_v2",
+                "dealsheet_uuid",
+                1000,
+            )
+            if row.get("dealsheet_uuid")
+        }
+
+    def upsert_dealsheet_staging(self, rows: list[dict]) -> tuple[int, int]:
+        """
+        Upsert dealsheet rows into dealsheet_sync_v2.
+
+        Rows are matched on dealsheet_uuid. Rows in the batch are marked active.
+        Returns (upserted_count, 0).
+        """
+        if not rows:
+            return 0, 0
+
+        for row in rows:
+            row["is_deleted"] = False
+            row["deleted_at"] = None
+
+        upserted = 0
+        batch_size = 500
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i : i + batch_size]
+            result = self.client.table("dealsheet_sync_v2").upsert(
+                chunk,
+                on_conflict="dealsheet_uuid",
+            ).execute()
+            upserted += len(result.data) if result.data else len(chunk)
+
+        return upserted, 0
+
+    def prune_dealsheet_orphans(self, active_uuids: set[str]) -> int:
+        """Delete dealsheet rows that are not in the latest sheet sync."""
+        if not active_uuids:
+            return 0
+
+        orphan_uuids: list[str] = []
+        for row in self._paginate_rows(
+            "dealsheet_sync_v2",
+            "dealsheet_uuid",
+            _DEALSHEET_PAGE_SIZE,
+        ):
+            dealsheet_uuid = row.get("dealsheet_uuid")
+            if dealsheet_uuid and dealsheet_uuid not in active_uuids:
+                orphan_uuids.append(dealsheet_uuid)
+
+        if not orphan_uuids:
+            return 0
+
+        deleted = 0
+        batch_size = 500
+        for i in range(0, len(orphan_uuids), batch_size):
+            chunk = orphan_uuids[i : i + batch_size]
+            self.client.table("dealsheet_sync_v2").delete().in_(
+                "dealsheet_uuid", chunk
+            ).execute()
+            deleted += len(chunk)
+
+        logger.info(f"Deleted {deleted} dealsheet rows not present in current sheet")
+        return deleted
 
     # -------------------------------------------------------------------------
     # Partner Lookup

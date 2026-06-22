@@ -41,6 +41,7 @@ Examples:
     python main.py --phase leads           # Sync leads
     python main.py --phase lead_magnets    # Sync LeadMaggy activities
     python main.py --phase activities      # Sync referrals + partner uploads
+    python main.py --phase dealsheet       # Sync Google Sheet dealsheet data
     
 Cron examples:
     # Incremental every 5 minutes
@@ -76,9 +77,9 @@ Cron examples:
     
     parser.add_argument(
         "--phase",
-        choices=["all", "partners", "leads", "lead_magnets", "activities"],
+        choices=["all", "partners", "leads", "lead_magnets", "activities", "dealsheet"],
         default="all",
-        help="Sync phase: all (default), partners, leads, lead_magnets, or activities",
+        help="Sync phase: all (default), partners, leads, lead_magnets, activities, or dealsheet",
     )
     
     parser.add_argument(

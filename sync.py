@@ -16,12 +16,17 @@ from uuid import UUID
 from close_client import CloseClient
 from supabase_client import SupabaseClient
 from partner_matcher import PartnerMatcher
+from google_sheets_client import fetch_google_sheet
+from lead_matcher import LeadMatcher
 from mappers import (
     map_lead,
     map_custom_activity,
     map_partner_referral,
     map_partner_upload,
     map_lead_magnet,
+    sheet_to_row,
+    dealsheet_uuid_for_row,
+    deterministic_uuid,
 )
 from config import Config
 
@@ -761,6 +766,164 @@ class SyncOrchestrator:
         
         return stats
 
+    # -------------------------------------------------------------------------
+    # Dealsheet Sync (Google Sheets -> dealsheet_sync_v2)
+    # -------------------------------------------------------------------------
+
+    def sync_dealsheet(self) -> SyncStats:
+        """
+        Sync dealsheet data from Google Sheets into dealsheet_sync_v2.
+
+        The table mirrors the current sheet: each row gets a content-based UUID,
+        and rows not in the sheet are deleted after a successful upsert.
+        """
+        missing = [
+            name
+            for name, value in {
+                "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY": Config.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
+                "GOOGLE_SERVICE_ACCOUNT_EMAIL": Config.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+                "GOOGLE_SHEET_ID": Config.GOOGLE_SHEET_ID,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"Missing dealsheet env vars: {', '.join(missing)}"
+            )
+
+        stats = SyncStats()
+        sync_name = "dealsheet"
+        run_started_at = datetime.now(timezone.utc)
+
+        run_id = self.supabase.create_sync_run(
+            sync_name=sync_name,
+            target_table="dealsheet_sync_v2",
+        )
+
+        try:
+            raw_rows = fetch_google_sheet()
+            mapped_rows = []
+            active_uuids: set[str] = set()
+
+            if raw_rows:
+                headers = raw_rows[0]
+                existing_uuids = self.supabase.get_dealsheet_uuids()
+                leads_by_name = self.supabase.get_leads_by_normalized_name()
+                lead_matcher = LeadMatcher(leads_by_name)
+
+                unique_companies: list[str] = []
+                seen_companies: set[str] = set()
+                for row_values in raw_rows[1:]:
+                    company = (sheet_to_row(headers, row_values).get("company") or "").strip()
+                    key = company.lower()
+                    if company and key not in seen_companies:
+                        seen_companies.add(key)
+                        unique_companies.append(company)
+
+                stub_leads_created = self.supabase.ensure_dealsheet_leads(
+                    unique_companies, lead_matcher
+                )
+                if stub_leads_created:
+                    logger.info(
+                        f"Dealsheet: created {stub_leads_created} stub leads "
+                        f"for companies not found in Close"
+                    )
+
+                rows_by_uuid: dict[str, dict] = {}
+                unlinked_leads = 0
+
+                for row_values in raw_rows[1:]:
+                    stats.fetched += 1
+                    try:
+                        mapped = sheet_to_row(headers, row_values)
+                        dealsheet_uuid = dealsheet_uuid_for_row(mapped)
+                        if not dealsheet_uuid:
+                            stats.skipped += 1
+                            continue
+
+                        if dealsheet_uuid in rows_by_uuid:
+                            suffix = 1
+                            while True:
+                                candidate = deterministic_uuid(
+                                    dealsheet_uuid, str(suffix)
+                                )
+                                if candidate not in rows_by_uuid:
+                                    dealsheet_uuid = candidate
+                                    break
+                                suffix += 1
+
+                        if not self.supabase.attach_lead_to_dealsheet_row(
+                            mapped, lead_matcher
+                        ):
+                            unlinked_leads += 1
+
+                        if dealsheet_uuid in existing_uuids:
+                            stats.updated += 1
+                        else:
+                            stats.inserted += 1
+
+                        mapped["dealsheet_uuid"] = dealsheet_uuid
+                        rows_by_uuid[dealsheet_uuid] = mapped
+                        active_uuids.add(dealsheet_uuid)
+                    except Exception as e:
+                        stats.add_error(f"Row {stats.fetched}: {str(e)}")
+                        logger.error(f"Error mapping dealsheet row {stats.fetched}: {e}")
+
+                mapped_rows = list(rows_by_uuid.values())
+                if unlinked_leads:
+                    logger.warning(
+                        f"Dealsheet: {unlinked_leads} rows could not be linked to a lead "
+                        f"(no matching lead_name/display_name for company)"
+                    )
+                else:
+                    logger.info(
+                        f"Dealsheet: all {len(mapped_rows)} rows linked to leads"
+                    )
+            else:
+                logger.warning("No rows returned from Google Sheet")
+
+            self.supabase.upsert_dealsheet_staging(mapped_rows)
+
+            if active_uuids:
+                pruned = self.supabase.prune_dealsheet_orphans(active_uuids)
+                if pruned:
+                    logger.info(f"Dealsheet: removed {pruned} rows not in current sheet")
+
+            self.supabase.update_watermark("dealsheet", run_started_at)
+
+            self.supabase.update_sync_run(
+                run_id=run_id,
+                status="completed",
+                fetched_count=stats.fetched,
+                inserted_count=stats.inserted,
+                updated_count=stats.updated,
+                error_count=stats.errors,
+                error_details=stats.error_details if stats.error_details else None,
+            )
+
+            logger.info(
+                f"Dealsheet sync completed: fetched={stats.fetched}, "
+                f"inserted={stats.inserted}, updated={stats.updated}, "
+                f"skipped={stats.skipped}, errors={stats.errors}"
+            )
+
+        except Exception as e:
+            logger.error(f"Dealsheet sync failed: {e}")
+            stats.add_error(str(e))
+
+            self.supabase.update_sync_run(
+                run_id=run_id,
+                status="failed",
+                fetched_count=stats.fetched,
+                inserted_count=stats.inserted,
+                updated_count=stats.updated,
+                error_count=stats.errors,
+                error_details=stats.error_details,
+            )
+            raise
+
+        return stats
+
 
 def run_sync(
     mode: str = "incremental",
@@ -774,7 +937,7 @@ def run_sync(
     Args:
         mode: "incremental" or "full"
         max_leads: Optional limit on number of leads to process (for testing)
-        phase: "all", "partners", "leads", "lead_magnets", or "activities"
+        phase: "all", "partners", "leads", "lead_magnets", "activities", or "dealsheet"
         skip_lock: If True, skip advisory lock check (for testing only)
     """
     logger.info(
@@ -826,6 +989,11 @@ def run_sync(
                 logger.info(
                     f"Activities: fetched={activity_stats.fetched}, updated={activity_stats.updated}"
                 )
+
+            if phase in ("all", "dealsheet"):
+                logger.info("=== Starting dealsheet sync ===")
+                dealsheet_stats = orchestrator.sync_dealsheet()
+                logger.info(f"Dealsheet: processed={dealsheet_stats.fetched}")
             
             logger.info(f"=== {mode.upper()} sync completed (phase={phase}) ===")
             

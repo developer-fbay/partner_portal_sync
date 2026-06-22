@@ -148,9 +148,27 @@ tail -f /var/log/close-sync.log
 
 ### 8. Updating after code changes
 
+From your machine, push to GitHub:
+
+```bash
+git add -A
+git commit -m "Your change description"
+git push origin main
+```
+
+On the droplet, pull and rebuild:
+
+```bash
+ssh root@YOUR_DROPLET_IP
+cd /opt/close-sync-worker
+bash scripts/deploy-on-droplet.sh
+```
+
+Or run the steps manually:
+
 ```bash
 cd /opt/close-sync-worker
-git pull          # or scp updated files
+git pull
 docker build -t close-sync-worker .
 ```
 

@@ -74,3 +74,10 @@ class Config:
 
     # Partner matching threshold (0-100)
     PARTNER_MATCH_THRESHOLD: int = int(os.getenv("PARTNER_MATCH_THRESHOLD", "80"))
+    LEAD_MATCH_THRESHOLD: int = int(os.getenv("LEAD_MATCH_THRESHOLD", "92"))
+
+    # Google Sheets dealsheet sync (required for --phase dealsheet)
+    GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "")
+    GOOGLE_SERVICE_ACCOUNT_EMAIL: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
+    GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+    GOOGLE_SHEET_RANGE: str = os.getenv("GOOGLE_SHEET_RANGE", "Sheet1!A:AM")

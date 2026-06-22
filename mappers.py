@@ -6,8 +6,9 @@ This module implements the Merge Policy from the spec:
 - Computed columns: derived from Close fields, treated as Close-owned
 """
 
+import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -731,3 +732,251 @@ def map_lead_magnet(activity: dict, custom_activity_uuid: str) -> dict:
         "pay_per_lead_quotezone": _parse_numeric(get_field("pay_per_lead")),
         "updated_at": datetime.utcnow().isoformat(),
     }
+
+
+# -----------------------------------------------------------------------------
+# Google Sheets Dealsheet Mapping
+# -----------------------------------------------------------------------------
+
+SHEET_HEADER_MAP = {
+    "YYYY-QX": "yyyy_qx",
+    "YYYY-MM": "yyyy_mm",
+    "YYYY-WW": "yyyy_ww",
+    "Date": "date",
+    "Company": "company",
+    "Company Name": "company",
+    "Lender": "lender",
+    "FBX/Funding Bay": "fbx_funding_bay",
+    "Closer": "closing_broker",
+    "Originator": "originator",
+    "RSA": "rsa",
+    "IF/Non-IF": "if_non_if",
+    "Type": "type",
+    "Facility Type": "facility_type",
+    "Facility Size": "facility_size",
+    "Contract end date": "contract_end_date",
+    "Notice period": "notice_period",
+    "Service charge": "service_charge",
+    "Monthly minimums": "monthly_minimums",
+    "Arrangement Fee": "arrangement_fee",
+    "Success Fee %": "success_fee_percent",
+    "Success Fee Amount": "success_fee_amount",
+    "Lender Fee Amount": "lender_fee_amount",
+    "Gross Rev": "invoice_amount",
+    "Partner Introducer": "partner_introducer",
+    "Paid Partner?": "paid_partner",
+    "Partner Owner": "partner_owner",
+    "Partner Comms - Success %": "partner_comms_success_percent",
+    "Partner Comms - Success Amount": "partner_comms_success_amount",
+    "Partner Comms - Lender %": "partner_comms_lender_percent",
+    "Partner Comms - Lender Amount": "partner_comms_lender_amount",
+    "Partner Comms - Total Amount": "partner_comms_total_amount",
+    "Net Rev": "net_rev",
+    "Lead Source": "lead_source",
+    "Campaign": "campaign",
+    "Sector": "sector",
+    "WW": "week",
+    "MM": "month_1",
+    "QX": "quarter",
+    "YYYY": "year",
+}
+
+SHEET_NUMERIC_COLUMNS = {
+    "facility_size",
+    "success_fee_percent",
+    "success_fee_amount",
+    "lender_fee_amount",
+    "invoice_amount",
+    "partner_comms_success_percent",
+    "partner_comms_success_amount",
+    "partner_comms_lender_percent",
+    "partner_comms_lender_amount",
+    "partner_comms_total_amount",
+    "net_rev",
+    "arrangement_fee",
+    "service_charge",
+    "monthly_minimums",
+}
+
+
+SHEET_DATE_COLUMNS = {"date", "contract_end_date"}
+
+
+def _parse_sheet_date(value: str) -> Optional[str]:
+    """Parse a sheet date cell to ISO format (YYYY-MM-DD) for Postgres."""
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    if "T" in value:
+        value = value.split("T", 1)[0]
+
+    if value.isdigit():
+        serial = int(value)
+        if 30000 <= serial <= 60000:
+            try:
+                return (datetime(1899, 12, 30) + timedelta(days=serial)).strftime(
+                    "%Y-%m-%d"
+                )
+            except (ValueError, OverflowError):
+                pass
+
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    logger.warning("Could not parse sheet date: %r", value)
+    return None
+
+
+def _parse_sheet_numeric(value: str):
+    """Parse a sheet cell value as float, stripping currency symbols and commas."""
+    if not value:
+        return None
+    cleaned = (
+        value.replace("£", "")
+        .replace("$", "")
+        .replace("€", "")
+        .replace(",", "")
+        .replace("%", "")
+        .strip()
+    )
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def sheet_to_row(headers: list[str], values: list[str]) -> dict:
+    """Map a Google Sheet row to dealsheet_sync_v2_staging column names."""
+    row = {}
+
+    for i, header in enumerate(headers):
+        header = header.strip()
+        db_col = SHEET_HEADER_MAP.get(header)
+        if not db_col:
+            db_col = next(
+                (col for key, col in SHEET_HEADER_MAP.items() if key.lower() == header.lower()),
+                None,
+            )
+        if not db_col:
+            continue
+        raw = values[i] if i < len(values) else ""
+        value = str(raw).strip() if raw is not None and str(raw).strip() else ""
+
+        if not value:
+            row[db_col] = None
+            continue
+
+        if db_col in SHEET_NUMERIC_COLUMNS:
+            row[db_col] = _parse_sheet_numeric(value)
+        elif db_col in ("rsa", "paid_partner"):
+            row[db_col] = value.lower() == "yes"
+        elif db_col == "year":
+            row[db_col] = _parse_int(value)
+        elif db_col in SHEET_DATE_COLUMNS:
+            row[db_col] = _parse_sheet_date(value)
+        else:
+            row[db_col] = value
+
+    if row.get("closing_broker") and not row.get("closer"):
+        row["closer"] = row["closing_broker"]
+    if row.get("invoice_amount") is not None and row.get("gross_rev") is None:
+        row["gross_rev"] = row["invoice_amount"]
+    if row.get("success_fee_amount") is not None and row.get("success_fee") is None:
+        row["success_fee"] = row["success_fee_amount"]
+    if row.get("month_1") is not None and row.get("month") is None:
+        row["month"] = row["month_1"]
+
+    return row
+
+
+def normalize_company(name: str) -> str:
+    """Normalize company name for matching across sheet and database."""
+    if not name:
+        return ""
+    return " ".join(str(name).strip().lower().split())
+
+
+def deterministic_uuid(*parts: str) -> str:
+    """Build a deterministic UUID v5-style identifier from concatenated parts."""
+    data = "|".join(parts)
+    digest = hashlib.sha1(data.encode("utf-8")).digest()
+    b = bytearray(digest[:16])
+    b[6] = (b[6] & 0x0F) | 0x50
+    b[8] = (b[8] & 0x3F) | 0x80
+    hex_str = b.hex()
+    return f"{hex_str[:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:]}"
+
+
+def _normalize_date_for_match(value) -> str:
+    if not value:
+        return ""
+    parsed = _parse_sheet_date(str(value))
+    return parsed or str(value).strip()
+
+
+def dealsheet_uuid_for_company(company: str, date: str = "") -> str:
+    """Stable dealsheet UUID from normalized company name and optional date."""
+    return deterministic_uuid(
+        normalize_company(company),
+        _normalize_date_for_match(date),
+    )
+
+
+DEALSHEET_UUID_FIELDS = (
+    "lender",
+    "facility_size",
+    "invoice_amount",
+    "lender_fee_amount",
+    "facility_type",
+    "type",
+    "partner_introducer",
+    "net_rev",
+)
+
+
+def dealsheet_uuid_for_row(mapped: dict) -> Optional[str]:
+    """Stable dealsheet UUID from row content so each sheet deal maps 1:1."""
+    company = normalize_company(mapped.get("company") or "")
+    if not company:
+        return None
+
+    parts = [company, _normalize_date_for_match(mapped.get("date"))]
+    for field in DEALSHEET_UUID_FIELDS:
+        value = mapped.get(field)
+        parts.append(str(value).strip() if value is not None else "")
+
+    return deterministic_uuid(*parts)
+
+
+def resolve_dealsheet_uuid(
+    mapped: dict,
+    existing_by_company: dict[str, list[dict]],
+) -> Optional[str]:
+    """
+    Match a sheet row to an existing dealsheet_uuid by company (and date when needed).
+
+    Returns None when company is missing. Generates a new UUID when the company
+    or company+date combination is not in the database (e.g. after a row was deleted).
+    """
+    company = normalize_company(mapped.get("company") or "")
+    if not company:
+        return None
+
+    date = _normalize_date_for_match(mapped.get("date"))
+    matches = existing_by_company.get(company, [])
+
+    if not matches:
+        return dealsheet_uuid_for_company(company, date)
+
+    for row in matches:
+        if _normalize_date_for_match(row.get("date")) == date:
+            return row["dealsheet_uuid"]
+
+    return dealsheet_uuid_for_company(company, date)
