@@ -4,7 +4,7 @@ A Python worker that syncs Close CRM leads and activities to Supabase on a recur
 
 ## Features
 
-- **Incremental sync** — polls for changes every few minutes using watermarks
+- **Incremental sync** — polls for changes on a schedule using watermarks (default: every 12 hours)
 - **Full re-sync** — complete refresh daily
 - **Partner sync** — activates/deactivates partners from Close; sets `paid_partner` from dealsheet commission rows linked by lead ID, close lead ID, introducer, or company name
 - **Idempotent upserts** — safe to retry, no duplicate data
@@ -137,17 +137,17 @@ crontab -e
 Add:
 
 ```cron
-# Incremental sync every 30 minutes
-*/30 * * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker >> /var/log/close-sync.log 2>&1
+# Incremental sync every 12 hours (08:00 and 20:00 UTC)
+0 8,20 * * * /opt/close-sync-worker/scripts/docker-run.sh >> /var/log/close-sync.log 2>&1
 
 # Full re-sync daily at 6:00 AM UTC
-0 6 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --mode full >> /var/log/close-sync.log 2>&1
+0 6 * * * /opt/close-sync-worker/scripts/docker-run.sh --mode full >> /var/log/close-sync.log 2>&1
 
-# Lead details enrichment daily at midnight UTC (full Close fetch per changed lead)
-0 0 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase lead_details >> /var/log/close-sync.log 2>&1
+# Partners activate/deactivate daily at midnight UTC
+0 0 * * * /opt/close-sync-worker/scripts/docker-run.sh --phase partners >> /var/log/close-sync.log 2>&1
 
-# Partner activate/deactivate weekly (Mondays 7:00 AM UTC)
-0 7 * * 1 docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase partners >> /var/log/close-sync.log 2>&1
+# Lead details enrichment daily at 1:00 AM UTC (staggered after partners)
+0 1 * * * /opt/close-sync-worker/scripts/docker-run.sh --phase lead_details >> /var/log/close-sync.log 2>&1
 ```
 
 View logs:

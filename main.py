@@ -45,17 +45,17 @@ Examples:
     python main.py --phase dealsheet       # Sync Google Sheet dealsheet data
     
 Cron examples:
-    # Incremental every 30 minutes
-    */30 * * * * cd /app && python main.py >> /var/log/close-sync.log 2>&1
+    # Incremental every 12 hours (08:00 and 20:00 UTC)
+    0 8,20 * * * cd /app && python main.py >> /var/log/close-sync.log 2>&1
     
     # Full sync daily at 6 AM
     0 6 * * * cd /app && python main.py --mode full >> /var/log/close-sync.log 2>&1
     
-    # Lead details enrichment daily at midnight
-    0 0 * * * cd /app && python main.py --phase lead_details >> /var/log/close-sync.log 2>&1
+    # Partners sync daily at midnight
+    0 0 * * * cd /app && python main.py --phase partners >> /var/log/close-sync.log 2>&1
     
-    # Partners sync weekly (activate/deactivate based on Close status)
-    0 7 * * 1 cd /app && python main.py --phase partners >> /var/log/close-sync.log 2>&1
+    # Lead details enrichment daily at 1 AM (staggered after partners)
+    0 1 * * * cd /app && python main.py --phase lead_details >> /var/log/close-sync.log 2>&1
         """,
     )
     

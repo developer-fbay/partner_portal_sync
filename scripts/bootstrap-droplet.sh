@@ -45,17 +45,17 @@ echo "==> Installing cron jobs..."
 (
   crontab -l 2>/dev/null | grep -v close-sync-worker | grep -v close-sync.log || true
   cat <<'CRON'
-# Incremental sync every 30 minutes
-*/30 * * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker >> /var/log/close-sync.log 2>&1
+# Incremental sync every 12 hours (08:00 and 20:00 UTC — offset from midnight jobs)
+0 8,20 * * * /opt/close-sync-worker/scripts/docker-run.sh >> /var/log/close-sync.log 2>&1
 
 # Full re-sync daily at 6:00 AM UTC
-0 6 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --mode full >> /var/log/close-sync.log 2>&1
+0 6 * * * /opt/close-sync-worker/scripts/docker-run.sh --mode full >> /var/log/close-sync.log 2>&1
 
-# Lead details enrichment daily at midnight UTC (full Close fetch per lead)
-0 0 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase lead_details >> /var/log/close-sync.log 2>&1
+# Partners activate/deactivate daily at midnight UTC
+0 0 * * * /opt/close-sync-worker/scripts/docker-run.sh --phase partners >> /var/log/close-sync.log 2>&1
 
-# Partner activate/deactivate weekly (Mondays 7:00 AM UTC)
-0 7 * * 1 docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase partners >> /var/log/close-sync.log 2>&1
+# Lead details enrichment daily at 1:00 AM UTC (staggered after partners)
+0 1 * * * /opt/close-sync-worker/scripts/docker-run.sh --phase lead_details >> /var/log/close-sync.log 2>&1
 CRON
 ) | crontab -
 
