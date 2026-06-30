@@ -38,7 +38,8 @@ Examples:
     
     # Run one phase only
     python main.py --phase partners        # Sync partner status from Close
-    python main.py --phase leads           # Sync leads
+    python main.py --phase leads           # Sync leads (smart-view search fields only)
+    python main.py --phase lead_details    # Full enrichment for leads already in DB
     python main.py --phase lead_magnets    # Sync LeadMaggy activities
     python main.py --phase activities      # Sync referrals + partner uploads
     python main.py --phase dealsheet       # Sync Google Sheet dealsheet data
@@ -77,9 +78,9 @@ Cron examples:
     
     parser.add_argument(
         "--phase",
-        choices=["all", "partners", "leads", "lead_magnets", "activities", "dealsheet"],
+        choices=["all", "partners", "leads", "lead_details", "lead_magnets", "activities", "dealsheet"],
         default="all",
-        help="Sync phase: all (default), partners, leads, lead_magnets, activities, or dealsheet",
+        help="Sync phase: all (default), partners, leads, lead_details, lead_magnets, activities, or dealsheet",
     )
     
     parser.add_argument(

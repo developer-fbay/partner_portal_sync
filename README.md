@@ -114,8 +114,15 @@ docker run --rm --env-file .env close-sync-worker
 # Full re-sync
 docker run --rm --env-file .env close-sync-worker --mode full
 
+# Full leads backfill (two steps — run in order)
+docker run --rm --env-file .env close-sync-worker --phase leads --mode full
+docker run --rm --env-file .env close-sync-worker --phase lead_details --mode full
+
 # Partners only
 docker run --rm --env-file .env close-sync-worker --phase partners
+
+# Full lead enrichment backfill (run after leads --mode full)
+docker run --rm --env-file .env close-sync-worker --phase lead_details --mode full
 ```
 
 Check Supabase table `crm_sync_runs` for a row with `status = 'completed'`.
@@ -181,6 +188,8 @@ Cron picks up the new image on the next run — no cron changes needed.
 pip install -r requirements.txt
 python main.py
 python main.py --mode full
+python main.py --phase leads --mode full
+python main.py --phase lead_details --mode full
 python main.py --phase partners --debug
 ```
 
@@ -188,11 +197,13 @@ python main.py --phase partners --debug
 
 | Phase | What it does |
 |-------|--------------|
-| `all` (default) | partners → leads → lead_magnets → activities |
+| `all` (default) | partners → leads → lead_magnets → activities → dealsheet |
 | `partners` | Sync partner active/inactive from Close + set `paid_partner` from dealsheet commission rows |
-| `leads` | Sync leads from Lead Source smart view |
-| `lead_magnets` | Sync LeadMaggy activities per lead |
-| `activities` | Sync partner referrals and uploads |
+| `leads` | Sync leads from Lead Source smart view using **search API fields only** (fast — populates `close_lead_id` and core columns). Run this first. |
+| `lead_details` | **Separate follow-up phase:** full `?_fields=_all` fetch per lead already in the `leads` table. Has its own watermark (`lead_details`). Run after `leads`. |
+| `lead_magnets` | Sync latest LeadMaggy activity per lead from the **CA - LeadMaggy** smart view (`CLOSE_LEAD_MAGNET_SMART_VIEW_ID`, default `save_Fupn8b6Fn8TIPA5dT1dPXJrtYqruaZOYhM1dE4ZTRGh`). Supports both `LeadMaggy` and `LeadMaggy - Updated` activity types. |
+| `activities` | Sync partner referrals (GEN1 + API), partner uploads (GEN2), and `custom_activities` parent rows |
+| `dealsheet` | Sync Google Sheet dealsheet data |
 
 ## Database tables
 

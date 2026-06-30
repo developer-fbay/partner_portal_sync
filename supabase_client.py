@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -19,6 +20,12 @@ ADVISORY_LOCK_ID = 1  # Global lock ID shared by all sync modes
 _COMMISSION_ZERO = frozenset({"0", "0.0", "0.00", "£0", "£0.00"})
 _DEALSHEET_PAGE_SIZE = 1000
 _LEAD_PAGE_SIZE = 1000
+_TRANSIENT_UPSERT_MARKERS = ("520", "502", "503", "504", "cloudflare", "bad gateway")
+
+
+def _is_transient_supabase_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_UPSERT_MARKERS)
 
 
 def _parse_commission_amount(value: Any) -> Optional[float]:
@@ -211,24 +218,86 @@ class SupabaseClient:
     # Data Upserts
     # -------------------------------------------------------------------------
 
-    def upsert_leads(self, leads: list[dict]) -> tuple[int, int]:
+    def iter_close_lead_ids(
+        self,
+        updated_since: Optional[datetime] = None,
+        page_size: int = 1000,
+    ):
+        """
+        Yield close_lead_id values from the leads table (non-deleted rows).
+
+        Used by lead_details sync after the leads phase has populated IDs.
+        """
+        offset = 0
+        while True:
+            query = (
+                self.client.table("leads")
+                .select("close_lead_id")
+                .eq("is_deleted", False)
+                .order("close_lead_id")
+            )
+            if updated_since:
+                query = query.gte("close_updated_at", updated_since.isoformat())
+
+            result = query.range(offset, offset + page_size - 1).execute()
+            rows = result.data or []
+            if not rows:
+                break
+
+            for row in rows:
+                close_lead_id = row.get("close_lead_id")
+                if close_lead_id:
+                    yield close_lead_id
+
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+    def upsert_leads(
+        self,
+        leads: list[dict],
+        *,
+        chunk_size: int = 100,
+        max_retries: int = 5,
+    ) -> tuple[int, int]:
         """
         Upsert leads to the leads table.
-        
-        Returns (inserted_count, updated_count).
-        Note: Supabase upsert doesn't distinguish insert vs update,
-        so we return total as updated_count for simplicity.
+
+        Large payloads (e.g. lead_details with full Close objects) should use a
+        smaller chunk_size. Retries transient Cloudflare / gateway errors (520, etc.).
         """
         if not leads:
             return 0, 0
-            
-        result = self.client.table("leads").upsert(
-            leads,
-            on_conflict="close_lead_id",
-        ).execute()
-        
-        count = len(result.data) if result.data else 0
-        return 0, count
+
+        total = 0
+        for i in range(0, len(leads), chunk_size):
+            chunk = leads[i : i + chunk_size]
+            total += self._upsert_leads_chunk(chunk, max_retries=max_retries)
+        return 0, total
+
+    def _upsert_leads_chunk(self, leads: list[dict], *, max_retries: int) -> int:
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                result = self.client.table("leads").upsert(
+                    leads,
+                    on_conflict="close_lead_id",
+                ).execute()
+                return len(result.data) if result.data else 0
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_retries - 1 or not _is_transient_supabase_error(exc):
+                    raise
+                wait = min(2 ** attempt, 30)
+                logger.warning(
+                    "Supabase leads upsert failed (attempt %s/%s), retrying in %ss: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    exc,
+                )
+                time.sleep(wait)
+        raise last_error  # pragma: no cover
 
     def upsert_custom_activities(self, activities: list[dict]) -> tuple[int, int]:
         """Upsert custom activities."""

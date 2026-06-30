@@ -9,6 +9,7 @@ Implements:
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -20,6 +21,7 @@ from google_sheets_client import fetch_google_sheet
 from lead_matcher import LeadMatcher
 from mappers import (
     map_lead,
+    map_lead_full,
     map_custom_activity,
     map_partner_referral,
     map_partner_upload,
@@ -179,6 +181,53 @@ class SyncOrchestrator:
         )
         return inserted, updated
 
+    def _prepare_lead_details_upsert(self, mapped: dict) -> dict:
+        """Shrink upsert payload for lead_details — omit raw Close blob."""
+        return {key: value for key, value in mapped.items() if key != "raw_payload"}
+
+    def _upsert_lead_details_batch(self, batch: list[dict]) -> tuple[int, int]:
+        """
+        Upsert enriched lead rows without change logging.
+
+        Full Close payloads are large; we use small chunks, skip audit logs
+        (which would duplicate the payload in after_data), and retry per-lead
+        if a chunk still fails.
+        """
+        seen = {}
+        for lead in batch:
+            seen[lead["close_lead_id"]] = self._prepare_lead_details_upsert(lead)
+        deduped_batch = list(seen.values())
+        chunk_size = Config.LEAD_DETAILS_BATCH_SIZE
+
+        try:
+            return self.supabase.upsert_leads(
+                deduped_batch,
+                chunk_size=chunk_size,
+            )
+        except Exception as batch_error:
+            logger.warning(
+                "Lead details batch upsert failed (%s leads), retrying one-by-one: %s",
+                len(deduped_batch),
+                batch_error,
+            )
+
+        updated = 0
+        for lead in deduped_batch:
+            try:
+                _, count = self.supabase.upsert_leads([lead], chunk_size=1)
+                updated += count
+            except Exception as exc:
+                logger.error(
+                    "Lead details upsert failed for %s: %s",
+                    lead.get("close_lead_id"),
+                    exc,
+                )
+
+        if updated == 0:
+            raise batch_error
+
+        return 0, updated
+
     # -------------------------------------------------------------------------
     # Leads Sync
     # -------------------------------------------------------------------------
@@ -186,82 +235,67 @@ class SyncOrchestrator:
     def sync_leads(self, mode: str = "incremental", max_leads: int = None) -> SyncStats:
         """
         Sync leads from Close smart view to Supabase.
-        
-        Args:
-            mode: "incremental" or "full"
-            max_leads: Optional limit on number of leads to process (for testing)
-            
-        Returns:
-            SyncStats with counts
+
+        Unchanged from the original flow: smart-view search fields, map, upsert.
+        For full Close export columns run --phase lead_details separately.
         """
         stats = SyncStats()
         sync_name = f"leads_{mode}"
-        
-        # Capture run_started_at BEFORE fetching (Invariant B)
+
         run_started_at = datetime.now(timezone.utc)
-        
-        # Get watermark for incremental
+
         date_filter = None
         if mode == "incremental":
             date_filter = self.supabase.get_watermark("leads")
             logger.info(f"Leads incremental sync from watermark: {date_filter}")
         else:
             logger.info("Leads full sync (no date filter)")
-        
-        # Initialize partner matcher
+
         self._init_partner_matcher()
-        
-        # Create sync run record
+
         run_id = self.supabase.create_sync_run(
             sync_name=sync_name,
             target_table="leads",
         )
-        
+
         try:
-            # Batch leads for bulk upsert
             batch = []
             batch_size = 100
-            
+
             for lead in self.close.get_leads_from_smart_view(
                 smart_view_id=Config.LEAD_SOURCE_SMART_VIEW_ID,
                 date_updated_gte=date_filter,
             ):
                 stats.fetched += 1
-                
-                # Check max_leads limit for testing
+
                 if max_leads and stats.fetched > max_leads:
                     logger.info(f"Reached max_leads limit ({max_leads}), stopping")
                     break
-                
+
                 try:
-                    # Resolve partner IDs
-                    partner_id, secondary_partner_id = self.partner_matcher.match_from_lead(lead)
-                    
-                    # Map to database schema
+                    partner_id, secondary_partner_id = self.partner_matcher.match_from_lead(
+                        lead
+                    )
                     mapped = map_lead(lead, partner_id, secondary_partner_id)
                     batch.append(mapped)
-                    
-                    # Upsert in batches (deduplicate by close_lead_id first)
+
                     if len(batch) >= batch_size:
                         inserted, updated = self._upsert_leads_batch_with_logging(batch)
                         stats.inserted += inserted
                         stats.updated += updated
                         batch = []
-                    
+
                 except Exception as e:
                     stats.add_error(f"Lead {lead.get('id')}: {str(e)}")
                     logger.error(f"Error processing lead {lead.get('id')}: {e}")
-            
-            # Upsert remaining batch (deduplicate by close_lead_id first)
+
             if batch:
                 inserted, updated = self._upsert_leads_batch_with_logging(batch)
                 stats.inserted += inserted
                 stats.updated += updated
-            
-            # Update watermark on success (Invariant B - anchored to run_started_at)
+
             self.supabase.update_watermark("leads", run_started_at)
-            
-            # Update sync run
+
             self.supabase.update_sync_run(
                 run_id=run_id,
                 status="completed",
@@ -271,14 +305,16 @@ class SyncOrchestrator:
                 error_count=stats.errors,
                 error_details=stats.error_details if stats.error_details else None,
             )
-            
-            logger.info(f"Leads sync completed: fetched={stats.fetched}, updated={stats.updated}, errors={stats.errors}")
-            
+
+            logger.info(
+                f"Leads sync completed: fetched={stats.fetched}, "
+                f"updated={stats.updated}, errors={stats.errors}"
+            )
+
         except Exception as e:
             logger.error(f"Leads sync failed: {e}")
             stats.add_error(str(e))
-            
-            # Mark run as failed - DO NOT advance watermark
+
             self.supabase.update_sync_run(
                 run_id=run_id,
                 status="failed",
@@ -289,7 +325,133 @@ class SyncOrchestrator:
                 error_details=stats.error_details,
             )
             raise
-        
+
+        return stats
+
+    # -------------------------------------------------------------------------
+    # Lead Details Sync (full per-lead fetch for rows already in leads table)
+    # -------------------------------------------------------------------------
+
+    def sync_lead_details(self, mode: str = "incremental", max_leads: int = None) -> SyncStats:
+        """
+        Enrich existing leads rows with a full Close fetch (?_fields=_all) per lead.
+
+        Reads close_lead_id from the leads table (run --phase leads first).
+        Uses its own watermark (lead_details); incremental mode filters by
+        close_updated_at on stored rows.
+        """
+        stats = SyncStats()
+        sync_name = f"lead_details_{mode}"
+        run_started_at = datetime.now(timezone.utc)
+
+        updated_since = None
+        if mode == "incremental":
+            updated_since = self.supabase.get_watermark("lead_details")
+            logger.info(f"Lead details incremental sync from watermark: {updated_since}")
+        else:
+            logger.info("Lead details full sync (all leads in DB)")
+
+        logger.info("Lead details: using per-lead full fetch (?_fields=_all)")
+
+        self._init_partner_matcher()
+        user_names = self.close.get_users_map()
+
+        run_id = self.supabase.create_sync_run(
+            sync_name=sync_name,
+            target_table="leads",
+        )
+
+        try:
+            close_lead_ids = list(
+                self.supabase.iter_close_lead_ids(updated_since=updated_since)
+            )
+            if max_leads:
+                close_lead_ids = close_lead_ids[:max_leads]
+
+            logger.info(f"Lead details: {len(close_lead_ids)} leads to enrich from DB")
+
+            if not close_lead_ids:
+                logger.warning(
+                    "No leads found in DB for lead_details — run --phase leads first"
+                )
+
+            batch = []
+            batch_size = Config.LEAD_DETAILS_BATCH_SIZE
+
+            for close_lead_id in close_lead_ids:
+                stats.fetched += 1
+
+                if stats.fetched % 100 == 0:
+                    logger.info(f"Lead details: processed {stats.fetched} leads so far")
+
+                try:
+                    lead = self.close.get_lead_full(close_lead_id)
+                    if not lead:
+                        stats.skipped += 1
+                        continue
+
+                    partner_id, secondary_partner_id = self.partner_matcher.match_from_lead(
+                        lead
+                    )
+                    mapped = map_lead_full(
+                        lead,
+                        partner_id,
+                        secondary_partner_id,
+                        user_names=user_names,
+                    )
+                    batch.append(mapped)
+
+                    if len(batch) >= batch_size:
+                        inserted, updated = self._upsert_lead_details_batch(batch)
+                        stats.inserted += inserted
+                        stats.updated += updated
+                        batch = []
+                        if Config.LEAD_DETAILS_BATCH_PAUSE_SEC > 0:
+                            time.sleep(Config.LEAD_DETAILS_BATCH_PAUSE_SEC)
+
+                except Exception as e:
+                    stats.add_error(f"Lead {close_lead_id}: {str(e)}")
+                    logger.error(f"Error enriching lead {close_lead_id}: {e}")
+
+            if batch:
+                inserted, updated = self._upsert_lead_details_batch(batch)
+                stats.inserted += inserted
+                stats.updated += updated
+
+            self.supabase.update_watermark("lead_details", run_started_at)
+
+            self.supabase.update_sync_run(
+                run_id=run_id,
+                status="completed",
+                fetched_count=stats.fetched,
+                inserted_count=stats.inserted,
+                updated_count=stats.updated,
+                skipped_count=stats.skipped,
+                error_count=stats.errors,
+                error_details=stats.error_details if stats.error_details else None,
+            )
+
+            logger.info(
+                f"Lead details sync completed: fetched={stats.fetched}, "
+                f"updated={stats.updated}, skipped={stats.skipped}, errors={stats.errors}"
+            )
+
+        except Exception as e:
+            logger.error(f"Lead details sync failed: {e}")
+            stats.add_error(str(e))
+
+            self.supabase.update_sync_run(
+                run_id=run_id,
+                status="failed",
+                fetched_count=stats.fetched,
+                inserted_count=stats.inserted,
+                updated_count=stats.updated,
+                skipped_count=stats.skipped,
+                error_count=stats.errors,
+                error_details=stats.error_details,
+            )
+            raise
+
         return stats
 
     # -------------------------------------------------------------------------
@@ -332,19 +494,27 @@ class SyncOrchestrator:
         try:
             activity_change_logs = []
 
-            # For LeadMaggy, we need to iterate through leads and fetch their latest activity
-            # In incremental mode, we only process leads updated since watermark
+            # Iterate the LeadMaggy smart view (leads that have a LeadMaggy activity).
+            # Do NOT use LEAD_SOURCE_SMART_VIEW_ID — that view has ~8k leads but only
+            # ~940 overlap with LeadMaggy; the CA LeadMaggy view has ~1,241 leads.
+            smart_view_id = Config.LEAD_MAGNET_SMART_VIEW_ID
+            if not smart_view_id:
+                raise ValueError(
+                    "CLOSE_LEAD_MAGNET_SMART_VIEW_ID is required for lead_magnets sync"
+                )
+
+            logger.info(f"LeadMaggy sync using smart view: {smart_view_id}")
+
             for lead in self.close.get_leads_from_smart_view(
-                smart_view_id=Config.LEAD_SOURCE_SMART_VIEW_ID,
+                smart_view_id=smart_view_id,
                 date_updated_gte=date_filter,
             ):
-                lead_id = lead.get("id")
-                stats.fetched += 1
-                
-                # Check max_leads limit for testing
-                if max_leads and stats.fetched > max_leads:
+                if max_leads and stats.fetched >= max_leads:
                     logger.info(f"Reached max_leads limit ({max_leads}), stopping")
                     break
+
+                lead_id = lead.get("id")
+                stats.fetched += 1
                 
                 try:
                     # Get latest LeadMaggy activity for this lead
@@ -466,7 +636,8 @@ class SyncOrchestrator:
         
         try:
             self._init_partner_matcher()
-            
+            user_names = self.close.get_users_map()
+
             # Store batches: (custom_activity_mapped, original_activity) tuples
             pending_activities = []
             batch_size = 100
@@ -517,10 +688,14 @@ class SyncOrchestrator:
                     
                     # Route to correct table based on activity type
                     if activity_type in Config.PARTNER_REFERRAL_TYPE_IDS:
-                        mapped = map_partner_referral(original_activity, uuid)
+                        mapped = map_partner_referral(
+                            original_activity, uuid, user_names=user_names
+                        )
                         referral_records.append(mapped)
                     elif activity_type == Config.PARTNER_UPLOAD_TYPE_ID:
-                        mapped = map_partner_upload(original_activity, uuid)
+                        mapped = map_partner_upload(
+                            original_activity, uuid, user_names=user_names
+                        )
                         upload_records.append(mapped)
                 
                 # Upsert to routing tables
@@ -1045,7 +1220,7 @@ def run_sync(
     Args:
         mode: "incremental" or "full"
         max_leads: Optional limit on number of leads to process (for testing)
-        phase: "all", "partners", "leads", "lead_magnets", "activities", or "dealsheet"
+        phase: "all", "partners", "leads", "lead_details", "lead_magnets", "activities", or "dealsheet"
         skip_lock: If True, skip advisory lock check (for testing only)
     """
     logger.info(
@@ -1082,6 +1257,14 @@ def run_sync(
                 leads_stats = orchestrator.sync_leads(mode, max_leads)
                 logger.info(
                     f"Leads: fetched={leads_stats.fetched}, updated={leads_stats.updated}"
+                )
+
+            if phase == "lead_details":
+                logger.info("=== Starting lead details enrichment ===")
+                details_stats = orchestrator.sync_lead_details(mode, max_leads)
+                logger.info(
+                    f"Lead details: fetched={details_stats.fetched}, "
+                    f"updated={details_stats.updated}, skipped={details_stats.skipped}"
                 )
             
             if phase in ("all", "lead_magnets"):

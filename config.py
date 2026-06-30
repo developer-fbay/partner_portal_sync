@@ -62,7 +62,13 @@ class Config:
     
     # Close Smart View ID for Lead Source
     LEAD_SOURCE_SMART_VIEW_ID: str = os.getenv("CLOSE_LEAD_SOURCE_SMART_VIEW_ID", "")
-    
+
+    # Close Smart View for leads with LeadMaggy activities (CA - LeadMaggy)
+    LEAD_MAGNET_SMART_VIEW_ID: str = os.getenv(
+        "CLOSE_LEAD_MAGNET_SMART_VIEW_ID",
+        "save_Fupn8b6Fn8TIPA5dT1dPXJrtYqruaZOYhM1dE4ZTRGh",
+    )
+
     # Close Smart View ID for active Partners
     PARTNERS_SMART_VIEW_ID: str = os.getenv(
         "CLOSE_PARTNERS_SMART_VIEW_ID",
@@ -83,6 +89,12 @@ class Config:
     # Partner matching threshold (0-100)
     PARTNER_MATCH_THRESHOLD: int = int(os.getenv("PARTNER_MATCH_THRESHOLD", "80"))
     LEAD_MATCH_THRESHOLD: int = int(os.getenv("LEAD_MATCH_THRESHOLD", "92"))
+
+    # lead_details upserts carry full Close payloads — keep batches small
+    LEAD_DETAILS_BATCH_SIZE: int = int(os.getenv("LEAD_DETAILS_BATCH_SIZE", "10"))
+    LEAD_DETAILS_BATCH_PAUSE_SEC: float = float(
+        os.getenv("LEAD_DETAILS_BATCH_PAUSE_SEC", "0.25")
+    )
 
     # Google Sheets dealsheet sync (required for --phase dealsheet)
     GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "")

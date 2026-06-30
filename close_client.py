@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.close.com/api/v1"
 
-# Fields to request from POST /data/search/ for lead mapping
+# Minimal fields for smart-view discovery when a per-lead full fetch follows.
+LEAD_ID_SEARCH_FIELDS = ["id"]
+
+# Fields for lightweight smart-view iteration (partner matching, lead magnets, etc.)
 LEAD_SEARCH_FIELDS = [
     "id",
     "name",
@@ -76,24 +79,54 @@ class CloseClient:
         if response.status_code == 429:
             logger.warning("Close API rate limit hit (429)")
             raise RateLimitError("Rate limited by Close API")
-        
+
+        if response.status_code >= 400:
+            logger.error(
+                "Close API error %s %s: %s",
+                method,
+                endpoint,
+                response.text[:2000],
+            )
+
         response.raise_for_status()
         return response.json()
 
     @staticmethod
-    def _normalize_search_lead(record: dict) -> dict:
-        """Convert a /data/search/ lead record into standard lead API shape."""
+    def normalize_lead_payload(record: dict) -> dict:
+        """Normalize a Close lead record (search or GET) into a consistent shape."""
         lead = {k: v for k, v in record.items() if k != "__object_type"}
 
         custom = dict(lead.get("custom") or {})
         for key, value in record.items():
             if key.startswith("custom."):
                 custom[key.removeprefix("custom.")] = value
+                lead[key] = value
 
         if custom:
             lead["custom"] = custom
 
         return lead
+
+    @staticmethod
+    def normalize_activity_payload(record: dict) -> dict:
+        """Normalize a Close custom activity (list or GET) into a consistent shape."""
+        activity = {k: v for k, v in record.items() if k != "__object_type"}
+
+        custom = dict(activity.get("custom") or {})
+        for key, value in record.items():
+            if key.startswith("custom."):
+                custom[key.removeprefix("custom.")] = value
+                activity[key] = value
+
+        if custom:
+            activity["custom"] = custom
+
+        return activity
+
+    @staticmethod
+    def _normalize_search_lead(record: dict) -> dict:
+        """Convert a /data/search/ lead record into standard lead API shape."""
+        return CloseClient.normalize_lead_payload(record)
 
     def _build_saved_search_query(
         self,
@@ -132,6 +165,7 @@ class CloseClient:
         self,
         smart_view_id: str,
         date_updated_gte: Optional[datetime] = None,
+        lead_fields: Optional[list[str]] = None,
     ) -> Generator[dict, None, None]:
         """
         Fetch leads from a saved smart view via POST /data/search/.
@@ -140,11 +174,12 @@ class CloseClient:
         all org leads). Using saved_search in Advanced Filtering returns the
         same ~8k filtered set shown in the Close UI.
         """
+        fields = lead_fields if lead_fields is not None else LEAD_SEARCH_FIELDS
         body: dict[str, Any] = {
             "query": self._build_saved_search_query(smart_view_id, date_updated_gte),
             "limit": 200,
             "include_counts": True,
-            "_fields": {"lead": LEAD_SEARCH_FIELDS},
+            "_fields": {"lead": fields},
             "sort": [
                 {
                     "direction": "desc",
@@ -193,13 +228,57 @@ class CloseClient:
         logger.info(f"Fetched {total_fetched} leads total")
 
     def get_lead_by_id(self, lead_id: str) -> Optional[dict]:
-        """Fetch a single lead by its Close ID."""
+        """Fetch a single lead by its Close ID (default field set)."""
         try:
-            return self._request("GET", f"/lead/{lead_id}/")
+            lead = self._request("GET", f"/lead/{lead_id}/")
+            return self.normalize_lead_payload(lead)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return None
             raise
+
+    def get_lead_full(self, lead_id: str) -> Optional[dict]:
+        """
+        Fetch a lead with all standard and smart fields (Close export-equivalent).
+
+        Uses ?_fields=_all so computed smart fields (call counts, last email, etc.)
+        are included alongside contacts, opportunities, and custom fields.
+        """
+        try:
+            lead = self._request(
+                "GET",
+                f"/lead/{lead_id}/",
+                params={"_fields": "_all"},
+            )
+            return self.normalize_lead_payload(lead)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
+    def get_users_map(self) -> dict[str, str]:
+        """Return Close user id → display name for resolving custom user references."""
+        users: dict[str, str] = {}
+        params: dict[str, Any] = {"_limit": 100, "_skip": 0}
+
+        while True:
+            data = self._request("GET", "/user/", params=params)
+            page = data.get("data", [])
+            for user in page:
+                user_id = user.get("id")
+                if not user_id:
+                    continue
+                first = (user.get("first_name") or "").strip()
+                last = (user.get("last_name") or "").strip()
+                name = f"{first} {last}".strip() or user.get("email") or user_id
+                users[user_id] = name
+
+            if len(page) < params["_limit"]:
+                break
+            params["_skip"] += params["_limit"]
+
+        logger.info("Loaded %s Close users for name resolution", len(users))
+        return users
 
     def get_activities(
         self,
@@ -241,7 +320,7 @@ class CloseClient:
 
                 activity_id = activity.get("id")
                 if activity_id:
-                    activity = self._request("GET", f"/activity/custom/{activity_id}/")
+                    activity = self.get_custom_activity(activity_id) or activity
 
                 yield activity
                 total_matched += 1
@@ -297,6 +376,9 @@ class CloseClient:
                 )
 
                 for activity in activities:
+                    activity_id = activity.get("id")
+                    if activity_id:
+                        activity = self.get_custom_activity(activity_id) or activity
                     yield activity, lead
                     activities_for_type += 1
                     total_activities += 1
@@ -345,8 +427,10 @@ class CloseClient:
             batch = data.get("data", [])
             if not batch:
                 break
-                
-            activities.extend(batch)
+
+            activities.extend(
+                self.normalize_activity_payload(activity) for activity in batch
+            )
 
             if len(batch) < params["_limit"]:
                 break
@@ -354,6 +438,16 @@ class CloseClient:
             skip += params["_limit"]
 
         return activities
+
+    def get_custom_activity(self, activity_id: str) -> Optional[dict]:
+        """Fetch a single custom activity with full field payload."""
+        try:
+            activity = self._request("GET", f"/activity/custom/{activity_id}/")
+            return self.normalize_activity_payload(activity)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
 
     def get_latest_lead_maggy_activity(self, lead_id: str) -> Optional[dict]:
         """
@@ -370,4 +464,10 @@ class CloseClient:
             return None
         
         # Already sorted descending by date_created, so first is latest
-        return activities[0]
+        latest = activities[0]
+        activity_id = latest.get("id")
+        if not activity_id:
+            return latest
+
+        # Re-fetch so all custom fields are present (list view can be sparse)
+        return self.get_custom_activity(activity_id) or latest

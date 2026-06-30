@@ -8,6 +8,7 @@ This module implements the Merge Policy from the spec:
 
 import hashlib
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -322,27 +323,187 @@ CLOSE_TO_DB_FIELD_MAP = {
     # Custom fields use custom.cf_XXX format - handled dynamically
 }
 
+CLOSE_OWNED_LEAD_COLUMN_SET = frozenset(CLOSE_OWNED_LEAD_COLUMNS)
+ENRICHMENT_COLUMN_SET = frozenset(ENRICHMENT_COLUMNS)
 
-def _safe_get(data: dict, *keys, default=None):
-    """Safely traverse nested dict keys."""
+# Custom label slug overrides (CSV export header → DB column)
+_CUSTOM_LABEL_SLUG_OVERRIDES = {
+    "in_funnel": "in_funnel",
+    "in_funnel_hot_warm": "in_funnel_hot_or_warm",
+    "webpage_form": "webpage_or_form",
+    "partner_split": "partner_split_pct",
+    "partner_prospect_or_lender": "partner_prospect_or_lender",
+    "quotezone_6m": "quotezone_gt_6m",
+    "r_d_hb": "r_and_d_hb",
+    "fb_or_fbx_web_inbound": "fb_or_fbx_web_inbound",
+    "fb_fbx": "fb_or_fbx",
+    "director_email": "director_email",
+    "company_registration_number": "company_registration_number",
+    "companies_house_url": "companies_house_url",
+    "company_website_lead_crm": "company_website_lead_crm",
+    "further_lead_info": "further_lead_info",
+    "sic_code": "sic_code",
+}
+
+# Close custom user-reference labels → (id_column, name_column)
+_CUSTOM_USER_REF_LABELS = {
+    "Lead Owner": ("lead_owner_id", "lead_owner_name"),
+    "Originator": ("originator_id", "originator_name"),
+    "Partner Owner": ("partner_owner_id", "partner_owner_name"),
+    "Analyst/Account Manager": ("analyst_or_account_manager_id", "analyst_or_account_manager_name"),
+    "CFA": ("cfa_id", "cfa_name"),
+    "FBX Principal": ("fbx_principal_id", "fbx_principal_name"),
+}
+
+# Top-level Close keys that differ from our DB column names.
+CLOSE_SCALAR_FIELD_ALIASES = dict(CLOSE_TO_DB_FIELD_MAP)
+
+# Nested objects handled separately — not copied verbatim in auto-mapping.
+_SKIP_LEAD_AUTO_MAP_KEYS = frozenset({
+    "contacts",
+    "addresses",
+    "opportunities",
+    "tasks",
+    "custom",
+    "integration_links",
+    "organization_id",
+    "models",
+})
+
+# Close user references → (id_column, name_column)
+_USER_REFERENCE_FIELDS = {
+    "created_by": ("created_by", "created_by_name"),
+    "updated_by": ("updated_by", "updated_by_name"),
+    "lead_owner": ("lead_owner_id", "lead_owner_name"),
+    "originator": ("originator_id", "originator_name"),
+    "partner_owner": ("partner_owner_id", "partner_owner_name"),
+    "triaged_by": ("triaged_by", None),
+}
+
+_DATETIME_COLUMN_SUFFIXES = ("_at", "_date", "_created", "_due", "_emailed", "_updated")
+_DATETIME_COLUMNS = frozenset(
+    column
+    for column in CLOSE_OWNED_LEAD_COLUMNS
+    if any(column.endswith(suffix) for suffix in _DATETIME_COLUMN_SUFFIXES)
+    or column in {
+        "first_email",
+        "first_emailed",
+        "first_call_created",
+        "last_call_created",
+        "first_sms_created",
+        "last_sms_created",
+        "email_last_opened",
+    }
+)
+
+# Postgres `date` columns populated from Close enrichment custom fields
+_ENRICHMENT_DATE_COLUMNS = frozenset(
+    column
+    for column in ENRICHMENT_COLUMNS
+    if column.endswith("_date") or column in {"year_end", "next_account_due_by", "next_account_made_up_to", "next_statement_due_by"}
+)
+
+_INT_COLUMNS = frozenset(
+    column
+    for column in CLOSE_OWNED_LEAD_COLUMNS
+    if column.startswith("num_") or column in {"years_of_trading", "year"}
+)
+
+_NUMERIC_COLUMNS = frozenset(
+    column
+    for column in CLOSE_OWNED_LEAD_COLUMNS
+    if any(token in column for token in ("value", "amount", "rev", "fee", "assets", "profit"))
+    or column in {"loan_amount", "pay_per_lead", "card_rev", "partner_split_pct"}
+)
+
+# Enrichment columns stored as numeric in Postgres (not in CLOSE_OWNED_LEAD_COLUMNS)
+_ENRICHMENT_NUMERIC_COLUMNS = frozenset(
+    {
+        "profit",
+        "net_worth",
+        "fixed_assets",
+        "total_funding_raised",
+        "turnover",
+        "net_assets",
+    }
+)
+
+
+def _safe_get(data: Any, *keys, default=None):
+    """Safely traverse nested dict keys or list indices."""
     result = data
     for key in keys:
         if isinstance(result, dict):
             result = result.get(key, default)
+        elif isinstance(result, list) and isinstance(key, int):
+            if 0 <= key < len(result):
+                result = result[key]
+            else:
+                return default
         else:
             return default
     return result if result is not None else default
+
+
+def _normalize_custom_scalar(value: Any) -> Any:
+    """Flatten list custom values and stringify for text columns."""
+    if isinstance(value, list):
+        if not value:
+            return None
+        if len(value) == 1:
+            return _normalize_custom_scalar(value[0])
+        return ", ".join(str(item) for item in value if item is not None)
+    return value
+
+
+def _parse_yes_no(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"yes", "true", "1"}:
+        return True
+    if text in {"no", "false", "0"}:
+        return False
+    return None
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[str]:
     """Parse ISO datetime string, return None if invalid."""
     if not value:
         return None
+    if not isinstance(value, str):
+        return None
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return dt.isoformat()
     except (ValueError, TypeError):
         return None
+
+
+def _parse_date(value: Optional[str]) -> Optional[str]:
+    """Parse a date string to ISO YYYY-MM-DD (handles UK DD/MM/YYYY from Close exports)."""
+    if not value:
+        return None
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+
+    iso_dt = _parse_datetime(value)
+    if iso_dt:
+        return iso_dt[:10]
+
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    return None
 
 
 def _extract_custom_field(lead: dict, field_id: str) -> Any:
@@ -356,14 +517,20 @@ def _parse_numeric(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        # Handle list values (take first element)
         if isinstance(value, list):
             value = value[0] if value else None
             if value is None:
                 return None
         if isinstance(value, str):
-            value = value.replace(",", "").replace("£", "").replace("$", "").strip()
-        return float(value) if value else None
+            text = value.replace(",", "").replace("£", "").replace("$", "").strip()
+            if not text or text.upper() in {"N/A", "NA", "TBC", "-", "NONE", "NULL"}:
+                return None
+            if text.startswith("(") and text.endswith(")"):
+                text = f"-{text[1:-1]}"
+            if text.upper().endswith("K"):
+                return float(text[:-1]) * 1000
+            value = text
+        return float(value)
     except (ValueError, TypeError, IndexError):
         return None
 
@@ -380,6 +547,8 @@ def _parse_int(value: Any) -> Optional[int]:
                 return None
         if isinstance(value, str):
             value = value.replace(",", "").strip()
+            if value == "":
+                return None
         return int(float(value))
     except (ValueError, TypeError, IndexError):
         return None
@@ -397,12 +566,17 @@ def _extract_primary_contact(lead: dict) -> dict:
     emails = primary.get("emails", [])
     urls = primary.get("urls", [])
     
+    first_name = primary.get("first_name")
+    last_name = primary.get("last_name")
+    if not first_name and not last_name and primary.get("name"):
+        first_name, last_name = _split_contact_name(primary.get("name"))
+    
     return {
         "contact_name": primary.get("name"),
         "contact_email": emails[0].get("email") if emails else None,
         "contact_phone": phones[0].get("phone") if phones else None,
-        "primary_contact_first_name": primary.get("first_name"),
-        "primary_contact_last_name": primary.get("last_name"),
+        "primary_contact_first_name": first_name,
+        "primary_contact_last_name": last_name,
         "primary_contact_title": primary.get("title"),
         "primary_contact_primary_phone_type": phones[0].get("type") if phones else None,
         "primary_contact_other_phones": str([p.get("phone") for p in phones[1:]]) if len(phones) > 1 else None,
@@ -430,26 +604,308 @@ def _extract_addresses(lead: dict) -> dict:
     return result
 
 
-def map_lead(lead: dict, partner_id: Optional[str] = None, secondary_partner_id: Optional[str] = None) -> dict:
+# Lead custom field IDs → (db_column, parser)
+LEAD_CUSTOM_FIELD_MAPPINGS = {
+    "lcf_pHVheIfAnOIBdoGLVhHxQmav8hxGOb2i6Ar8h2tuV77": ("lead_source", None),
+    "lcf_fSb5j0xDXyJiKLwdHPYjvRCdbkpUJJpn9krReNKNOyy": ("partner_introducer", None),
+    "lcf_yDWySRCcDFhvCrK0UzCI5slU1XSYCP4ni4j6ZSODBzD": ("company_registration_number", None),
+    "lcf_Scsqcdb6i2SetF7ZUYLJ1k3sKFBCTzmgB3z1U9ebLN0": ("lead_owner_id", None),
+    "lcf_8s1eNJGYT2cmv722G5LRltCAlluT5fYOLfjLDKtTvcK": ("partner_prospect_or_lender", _normalize_custom_scalar),
+    "cf_cbkJ31wiw7qsL5IjCGMKyEEneuzd9fgXSz5B0vOi2CA": ("loan_amount", _parse_numeric),
+    "cf_1BaclVASPoUDWFKNh2WwoU74O4RZhIZfInJA9WvipZ9": ("company_registration_number", None),
+    "cf_KlLz6gUfydy56wh6Lm0Qkc1032pIWle1auZ6fQ6p6Uw": ("companies_house_url", None),
+    "cf_rjb2fDFC55AdRComep4ycZgDtg5Xcx0fYPIM7aE5n8N": ("years_of_trading", _parse_int),
+    "cf_83OWakxD8TRT2UjzqbRMW3t1m9IRydJQC7hais5gXls": ("paid_partner", _parse_yes_no),
+    "cf_F2lNv5XrVUBxKGPmXWxqPna9VZqDaqkDREe4rLi4YxC": ("partner_split_pct", _normalize_custom_scalar),
+    "cf_GCBQx6Sht3pwfWjPxdcCOJnZVgHnXnAiPwZFIlf2diD": ("partner_split_type", None),
+    "cf_ILleH7M40c2ps0jXxhyTgMdOj8eKLqdDQK2QDeRdfFB": ("originator_id", None),
+    "cf_VW2Vz2O4XrH3O3VcAoH0CXZRVPnRo8CrT27MDO9CXf7": ("partner_owner_id", _normalize_custom_scalar),
+    "cf_hi0bhzuTnyvY6HnZlhPZwMQAOtGz01XZhnlmfrIM7HJ": ("fb_or_fbx", None),
+    "cf_qvzmy7ALxb2Szbt4Jn3lSCBlY5OAjmm8io5A9v03oB6": ("smart_view_tag", None),
+}
+
+# Human-readable Close custom labels (custom dict keys) → (db_column, parser)
+LEAD_CUSTOM_LABEL_MAPPINGS = {
+    "Lead Source": ("lead_source", None),
+    "Partner Introducer": ("partner_introducer", None),
+    "Company Registration number": ("company_registration_number", None),
+    "Lead Owner": ("lead_owner_id", None),
+    "Originator": ("originator_id", None),
+    "Paid partner": ("paid_partner", _parse_yes_no),
+    "Partner Owner": ("partner_owner_id", _normalize_custom_scalar),
+    "Partner split %": ("partner_split_pct", _normalize_custom_scalar),
+    "Partner split type": ("partner_split_type", None),
+    "Partner, Prospect or Lender?": ("partner_prospect_or_lender", _normalize_custom_scalar),
+    "Smart View Tag": ("smart_view_tag", None),
+    "FB/FBX": ("fb_or_fbx", None),
+    "Campaign": ("campaign", None),
+    "Campaign (OLD)": ("campaign_old", None),
+    "Turnover": ("turnover", _parse_numeric),
+    "SIC Code": ("sic_code", None),
+    "Industry": ("industry", None),
+    "Sector": ("sector", None),
+    "Accountant": ("accountant", None),
+    "Accounting Firm": ("accounting_firm", None),
+    "Company Website (Lead CRM)": ("company_website_lead_crm", None),
+    "Companies House URL": ("companies_house_url", None),
+    "Company Status": ("company_status", None),
+    "Company Type": ("company_type", None),
+    "B2B or B2C": ("b2b_or_b2c", None),
+    "Business Model": ("business_model", None),
+    "Use of Funds": ("use_of_funds", None),
+    "Lender": ("lender", None),
+    "Net Assets": ("net_assets", _parse_numeric),
+    "Profitability": ("profitability", None),
+    "Years of Trading": ("years_of_trading", _parse_int),
+    "In Funnel": ("in_funnel", None),
+    "In Funnel Hot/Warm": ("in_funnel_hot_or_warm", None),
+    "Enrichment status": ("enrichment_status", None),
+    "GCLID": ("gclid", None),
+    "Card Rev": ("card_rev", _parse_numeric),
+    "Date": ("date", None),
+    "Disco Date": ("disco_date", None),
+    "Discovery Date": ("discovery_date", None),
+    "Dupe test": ("dupe_test", None),
+    "First Source": ("first_source", None),
+    "Further Lead Info": ("further_lead_info", None),
+    "IF Contract End Date": ("if_contract_end_date", None),
+    "LC Deb End Date": ("lc_deb_end_date", None),
+    "LC Deb Start Date": ("lc_deb_start_date", None),
+    "Mbali measure": ("mbali_measure", None),
+    "Quotezone >6m": ("quotezone_gt_6m", None),
+    "R&D HB": ("r_and_d_hb", None),
+    "SDLT HB": ("sdlt_hb", None),
+    "Webpage/Form": ("webpage_or_form", None),
+    "FB or FBX Web Inbound": ("fb_or_fbx_web_inbound", None),
+    "Web Inbound Campaign": ("web_inbound_campaign", None),
+    "Outreach Tool": ("outreach_tool", None),
+    "Sequence Name": ("sequence_name", None),
+    "Split Lender %": ("split_lender_pct", None),
+    "Split Success %": ("split_success_pct", None),
+    "Partner Type": ("partner_type", None),
+    "Sent to Partner": ("sent_to_partner", None),
+    "Google Drive Link": ("google_drive_link", None),
+    "Supernormal Link": ("supernormal_link", None),
+    "Triage Checked": ("triage_checked", None),
+    "Triage Assist": ("triage_assist", None),
+    "External UUID": ("external_uuid", None),
+    "MOB": ("mob", None),
+    "Timestamp": ("timestamp", None),
+    "Pay Per Lead": ("pay_per_lead", _parse_numeric),
+    "Loan Amount": ("loan_amount", _parse_numeric),
+}
+
+
+def _custom_label_to_db_column(label: str) -> Optional[str]:
+    """Map a Close custom field label to a DB column (owned or enrichment)."""
+    if label in LEAD_CUSTOM_LABEL_MAPPINGS:
+        return LEAD_CUSTOM_LABEL_MAPPINGS[label][0]
+    slug = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        label.lower().replace("/", "_or_").replace("?", ""),
+    ).strip("_")
+    slug = _CUSTOM_LABEL_SLUG_OVERRIDES.get(slug, slug)
+    if slug in CLOSE_OWNED_LEAD_COLUMN_SET or slug in ENRICHMENT_COLUMN_SET:
+        return slug
+    return None
+
+
+def _split_contact_name(full_name: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not full_name:
+        return None, None
+    parts = full_name.strip().split(None, 1)
+    if len(parts) == 1:
+        return parts[0], None
+    return parts[0], parts[1]
+
+
+def _resolve_user_id(value: Any) -> Optional[str]:
+    """Extract a Close user id from a custom user-reference value."""
+    normalized = _normalize_custom_scalar(value)
+    if isinstance(normalized, str) and normalized.startswith("user_"):
+        return normalized
+    return None
+
+
+def _coerce_lead_scalar(db_column: str, value: Any) -> Any:
+    """Coerce a Close scalar/smart-field value to the appropriate DB type."""
+    if value is None or value == "":
+        return None
+    if db_column == "paid_partner":
+        return _parse_yes_no(value)
+    if isinstance(value, (dict, list)):
+        if db_column in _INT_COLUMNS or db_column in _NUMERIC_COLUMNS:
+            return None
+        return _normalize_custom_scalar(value)
+
+    if db_column in _DATETIME_COLUMNS:
+        return _parse_datetime(value) if isinstance(value, str) else value
+    if db_column in _ENRICHMENT_DATE_COLUMNS:
+        return _parse_date(value) if isinstance(value, str) else value
+    if db_column in _INT_COLUMNS:
+        return _parse_int(value)
+    if db_column in _NUMERIC_COLUMNS or db_column in _ENRICHMENT_NUMERIC_COLUMNS:
+        return _parse_numeric(value)
+    return value
+
+
+def _set_if_empty(mapped: dict, db_column: str, value: Any) -> None:
+    if db_column not in CLOSE_OWNED_LEAD_COLUMN_SET:
+        return
+    if mapped.get(db_column) is not None:
+        return
+    mapped[db_column] = _coerce_lead_scalar(db_column, value)
+
+
+def _assign_close_owned(mapped: dict, db_column: str, value: Any) -> None:
+    """Assign a Close-owned column, including explicit nulls (merge policy)."""
+    if db_column not in CLOSE_OWNED_LEAD_COLUMN_SET:
+        return
+    mapped[db_column] = _coerce_lead_scalar(db_column, value)
+
+
+def _map_custom_fields(
+    lead: dict,
+    mapped: dict,
+    user_names: Optional[dict[str, str]] = None,
+) -> None:
+    custom = lead.get("custom") or {}
+
+    for close_field, (db_column, parser) in LEAD_CUSTOM_FIELD_MAPPINGS.items():
+        value = custom.get(close_field)
+        if value is None and close_field in lead:
+            value = lead.get(close_field)
+        if value is None and f"custom.{close_field}" in lead:
+            value = lead.get(f"custom.{close_field}")
+        if value is None:
+            continue
+        parsed = parser(value) if parser else value
+        _assign_mapped_column(mapped, db_column, parsed)
+
+    for label, (db_column, parser) in LEAD_CUSTOM_LABEL_MAPPINGS.items():
+        value = custom.get(label)
+        if value is None:
+            continue
+        if mapped.get(db_column) is not None:
+            continue
+        parsed = parser(value) if parser else value
+        _assign_mapped_column(mapped, db_column, parsed)
+
+    for label, (id_column, name_column) in _CUSTOM_USER_REF_LABELS.items():
+        user_id = _resolve_user_id(custom.get(label))
+        if not user_id:
+            continue
+        _set_if_empty(mapped, id_column, user_id)
+        if name_column and user_names:
+            _set_if_empty(mapped, name_column, user_names.get(user_id))
+
+    mapped_labels = set(LEAD_CUSTOM_LABEL_MAPPINGS) | set(_CUSTOM_USER_REF_LABELS)
+    for label, value in custom.items():
+        if label.startswith(("cf_", "lcf_")):
+            continue
+        if label in mapped_labels:
+            continue
+        db_column = _custom_label_to_db_column(label)
+        if not db_column or mapped.get(db_column) is not None:
+            continue
+        _assign_mapped_column(mapped, db_column, value)
+
+
+def _assign_mapped_column(mapped: dict, db_column: str, value: Any) -> None:
+    """Write a mapped value to Close-owned or Close-sourced enrichment columns."""
+    if db_column in CLOSE_OWNED_LEAD_COLUMN_SET:
+        mapped[db_column] = _coerce_lead_scalar(db_column, value)
+    elif db_column in ENRICHMENT_COLUMN_SET and value is not None:
+        mapped[db_column] = _coerce_lead_scalar(db_column, value)
+
+
+def _map_auto_fields(lead: dict, mapped: dict) -> None:
+    """Map top-level Close fields and smart fields that match DB column names."""
+    for key, value in lead.items():
+        if key in _SKIP_LEAD_AUTO_MAP_KEYS or key.startswith("custom."):
+            continue
+
+        db_column = CLOSE_SCALAR_FIELD_ALIASES.get(key, key)
+        _assign_close_owned(mapped, db_column, value)
+
+
+def _map_user_references(
+    lead: dict,
+    mapped: dict,
+    user_names: Optional[dict[str, str]] = None,
+) -> None:
+    for close_key, (id_column, name_column) in _USER_REFERENCE_FIELDS.items():
+        value = lead.get(close_key)
+        if value is None:
+            continue
+
+        if isinstance(value, dict):
+            _set_if_empty(mapped, id_column, value.get("id"))
+            if name_column:
+                _set_if_empty(
+                    mapped,
+                    name_column,
+                    value.get("name") or value.get("display_name"),
+                )
+        else:
+            _set_if_empty(mapped, id_column, value)
+            if name_column and user_names and isinstance(value, str):
+                _set_if_empty(mapped, name_column, user_names.get(value))
+
+
+def _map_primary_opportunity(lead: dict, mapped: dict) -> None:
+    opportunities = lead.get("opportunities") or []
+    if not opportunities:
+        return
+
+    primary = next(
+        (opp for opp in opportunities if opp.get("status_type") == "active"),
+        opportunities[0],
+    )
+
+    opportunity_field_map = {
+        "id": "close_opportunity_id",
+        "status_id": "primary_opportunity_status",
+        "status_label": "primary_opportunity_status_label",
+        "status_type": "primary_opportunity_status_type",
+        "confidence": "primary_opportunity_confidence",
+        "date_created": "primary_opportunity_created",
+        "date_won": "primary_opportunity_date_won",
+        "value_period": "primary_opportunity_period",
+        "pipeline_id": "primary_opportunity_pipeline_id",
+        "pipeline_name": "primary_opportunity_pipeline_name",
+        "value": "primary_opportunity_value",
+        "value_formatted": "primary_opportunity_value_summary",
+        "date_updated": "primary_opportunity_updated",
+        "user_id": "primary_opportunity_user_id",
+        "user_name": "primary_opportunity_user_name",
+    }
+
+    for opp_key, db_column in opportunity_field_map.items():
+        if opp_key not in primary:
+            continue
+        value = primary[opp_key]
+        if opp_key in {"date_created", "date_won", "date_updated"}:
+            value = _parse_datetime(value)
+        elif opp_key in {"confidence", "value"}:
+            value = _parse_numeric(value)
+        _set_if_empty(mapped, db_column, value)
+
+
+def map_lead(
+    lead: dict,
+    partner_id: Optional[str] = None,
+    secondary_partner_id: Optional[str] = None,
+) -> dict:
     """
-    Map a Close CRM lead to database columns.
-    
-    Only includes Close-owned columns - enrichment columns are never touched.
-    
-    Args:
-        lead: Raw lead data from Close API
-        partner_id: Resolved partner UUID (from fuzzy matching)
-        secondary_partner_id: Resolved secondary partner UUID
-        
-    Returns:
-        Dict with only Close-owned columns, ready for upsert
+    Map a Close smart-view search lead to Close-owned database columns only.
+
+    Used by --phase leads. For full export columns use map_lead_full in lead_details.
     """
     mapped = {
-        # Core identifiers
         "close_lead_id": lead.get("id"),
         "close_contact_id": _safe_get(lead, "contacts", 0, "id") if lead.get("contacts") else None,
-        
-        # Basic info
         "lead_name": lead.get("name"),
         "display_name": lead.get("display_name"),
         "status_id": lead.get("status_id"),
@@ -457,30 +913,17 @@ def map_lead(lead: dict, partner_id: Optional[str] = None, secondary_partner_id:
         "description": lead.get("description"),
         "url": lead.get("url"),
         "html_url": lead.get("html_url"),
-        
-        # Timestamps
         "close_created_at": _parse_datetime(lead.get("date_created")),
         "close_updated_at": _parse_datetime(lead.get("date_updated")),
-        
-        # Partner references
         "partner_id": partner_id,
         "secondary_partner_id": secondary_partner_id,
-        
-        # Store raw payload for debugging
         "raw_payload": lead,
     }
-    
-    # Extract primary contact
+
     mapped.update(_extract_primary_contact(lead))
-    
-    # Extract addresses
     mapped.update(_extract_addresses(lead))
-    
-    # Extract custom fields using Close field IDs
+
     custom = lead.get("custom", {})
-    
-    # Lead custom field mappings (lcf_ prefix for lead-level fields)
-    # Format: close_field_id -> (db_column, parser_function or None for string)
     lead_custom_field_mappings = {
         "lcf_pHVheIfAnOIBdoGLVhHxQmav8hxGOb2i6Ar8h2tuV77": ("lead_source", None),
         "lcf_fSb5j0xDXyJiKLwdHPYjvRCdbkpUJJpn9krReNKNOyy": ("partner_introducer", None),
@@ -495,18 +938,83 @@ def map_lead(lead: dict, partner_id: Optional[str] = None, secondary_partner_id:
         "cf_agED7vPcyJttr6nWLWmqyyiN2LL2QYSXFFJbvHocVYX": ("profitability", None),
         "cf_G224hFBn5sde4b7zX3rdejIY0P5dO6zRNyf2Dx1Pfh3": ("turnover", _parse_numeric),
     }
-    
+
     for close_field, (db_column, parser) in lead_custom_field_mappings.items():
         if close_field in custom:
             value = custom[close_field]
             mapped[db_column] = parser(value) if parser else value
-    
-    # Filter to only Close-owned columns
+
     result = {}
     for key, value in mapped.items():
         if key in CLOSE_OWNED_LEAD_COLUMNS or key == "close_lead_id":
             result[key] = value
-    
+
+    return result
+
+
+def map_lead_full(
+    lead: dict,
+    partner_id: Optional[str] = None,
+    secondary_partner_id: Optional[str] = None,
+    user_names: Optional[dict[str, str]] = None,
+) -> dict:
+    """
+    Map a full Close lead (?_fields=_all) to Close-owned and enrichment columns.
+
+    Used by --phase lead_details only.
+    """
+    mapped = {
+        "close_lead_id": lead.get("id"),
+        "close_contact_id": _safe_get(lead, "contacts", 0, "id") if lead.get("contacts") else None,
+        "lead_name": lead.get("name"),
+        "display_name": lead.get("display_name"),
+        "status_id": lead.get("status_id"),
+        "status_label": lead.get("status_label"),
+        "description": lead.get("description"),
+        "url": lead.get("url"),
+        "html_url": lead.get("html_url"),
+        "close_created_at": _parse_datetime(lead.get("date_created")),
+        "close_updated_at": _parse_datetime(lead.get("date_updated")),
+        "partner_id": partner_id,
+        "secondary_partner_id": secondary_partner_id,
+        "raw_payload": lead,
+    }
+
+    mapped.update(_extract_primary_contact(lead))
+    mapped.update(_extract_addresses(lead))
+    _map_custom_fields(lead, mapped, user_names=user_names)
+    _map_user_references(lead, mapped, user_names=user_names)
+    _map_primary_opportunity(lead, mapped)
+    _map_auto_fields(lead, mapped)
+
+    for column in CLOSE_OWNED_LEAD_COLUMNS:
+        if column.startswith("num_") and isinstance(mapped.get(column), (int, float)):
+            mapped[column] = str(mapped[column])
+
+    if lead.get("status") is not None:
+        _set_if_empty(mapped, "status", lead.get("status"))
+
+    if mapped.get("primary_address_summary") is None:
+        addresses = lead.get("addresses") or []
+        if addresses:
+            first = addresses[0]
+            parts = [
+                first.get("address_1"),
+                first.get("city"),
+                first.get("zipcode"),
+                first.get("country"),
+            ]
+            summary = ", ".join(part for part in parts if part)
+            if summary:
+                mapped["primary_address_summary"] = summary
+
+    result = {}
+    for key, value in mapped.items():
+        if key in CLOSE_OWNED_LEAD_COLUMNS or key == "close_lead_id":
+            result[key] = value
+        elif key in ENRICHMENT_COLUMN_SET and value is not None:
+            result[key] = value
+
     return result
 
 
@@ -531,107 +1039,192 @@ def map_custom_activity(activity: dict, partner_id: Optional[str] = None) -> dic
     }
 
 
-def map_partner_referral(activity: dict, custom_activity_uuid: str) -> dict:
+def _get_custom_field(custom: dict, field_id: str) -> Any:
+    """Read a custom field by Close field id from a normalized activity custom dict."""
+    if not custom or not field_id:
+        return None
+    return custom.get(field_id)
+
+
+def _format_activity_custom_value(
+    value: Any,
+    user_names: Optional[dict[str, str]] = None,
+) -> Any:
+    """Coerce activity custom values (user, contact, choices, lists) to text."""
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, dict):
+        user_id = value.get("id")
+        if isinstance(user_id, str) and user_id.startswith("user_"):
+            if user_names and user_id in user_names:
+                return user_names[user_id]
+            return value.get("name") or value.get("display_name") or user_id
+        return value.get("name") or value.get("id") or str(value)
+
+    normalized = _normalize_custom_scalar(value)
+    if isinstance(normalized, str) and normalized.startswith("user_") and user_names:
+        return user_names.get(normalized, normalized)
+    if isinstance(normalized, list):
+        return ", ".join(str(item) for item in normalized if item is not None)
+    return normalized
+
+
+def _read_activity_custom(
+    custom: dict,
+    field_id: str,
+    user_names: Optional[dict[str, str]] = None,
+) -> Any:
+    return _format_activity_custom_value(
+        _get_custom_field(custom, field_id),
+        user_names=user_names,
+    )
+
+
+def map_partner_referral(
+    activity: dict,
+    custom_activity_uuid: str,
+    user_names: Optional[dict[str, str]] = None,
+) -> dict:
     """
     Map a partner referral activity to the partner_referral table.
-    
+
     Handles both activity types:
     - GEN1. Referral Upload (actitype_1CKUCsigQLAPoNmDABmjcj)
     - API - Referral Upload (actitype_0PpighCxVchK68dd8Hknzd)
-    
-    Args:
-        activity: Raw activity data from Close API
-        custom_activity_uuid: UUID from custom_activities table
-        
-    Returns:
-        Dict ready for upsert to partner_referral
     """
     custom = activity.get("custom", {}) or {}
-    
-    # Field ID mappings for GEN1. Referral Upload
-    gen1_fields = {
-        "partner_owner": "cf_gf3TBdO9xqr3LB9SP6XJMX7u5GbRFgknoIPGo0mVF2B",
-        "broker_to_send_to": "cf_Xi0eO5V1VWXDHdLNvwcn7oFHSBtdKBuHbA5UYalIrgW",
-        "type_of_partner": "cf_CqnuZdXRLGdEBfoNojmtNh3GkGSxmFLrykItNz4F7Eq",
-        "company_name": "cf_E9gIFnO0ybTo1VgNjmIghOmAPnaLIeuc4gQEueY7LVm",
-        "company_number": "cf_Fh7nPBkHbs0PLXRKxgpsNWnxoofflKYdLtzzcqy3pUJ",
-        "contact_name": "cf_WmVlnmCidqZGKmed44H5sloPxcUGVqVVwgI4Qg0yF7z",
-        "contact_phone_number": "cf_4kH5ScazObc7Phz5Fuqdsc2MuW9W3Lsmbufhn39fmbK",
-        "contact_email_address": "cf_4K6Xv4zg50JQxyRQMRcL2MiolAkszKQqW5XiYoSCzay",
-        "fb_fbx": "cf_Y6OET4Q82lVHDrPblXhJHA2Ojaz7Mvl57kV8sCM9fHP",
-        "notes": "cf_TQbqzxpfF6RsGWqxK6z9cQFWpMD4ZssEWK99Q8YjUQh",
-    }
-    
-    # Field ID mappings for API - Referral Upload
-    api_fields = {
-        "partner_owner": "cf_uu8Zvx863K7mxRgKRFZh9o4ORAbzTBAYOpzHSgXJGIl",
-        "company_name": "cf_0gmxLCFokmWcEfaq5yQbK7AwJAjkI4MZ1rLkLG8wu1c",  # "Partner" field
-        "type_of_partner": "cf_xOmyo63cf4EslqGvyScZGnSC7axiT0fBfmIjbxBClya",
-        "notes": "cf_PjpQQJQCpdq9mOYKynKuUHp7knWSl8miqehVpd1Sbdn",
-    }
-    
-    def get_field(db_column: str) -> Any:
-        """Try GEN1 field ID first, then API field ID."""
-        if gen1_fields.get(db_column) and custom.get(gen1_fields[db_column]) is not None:
-            return custom.get(gen1_fields[db_column])
-        if api_fields.get(db_column) and custom.get(api_fields[db_column]) is not None:
-            return custom.get(api_fields[db_column])
+    activity_type = activity.get("custom_activity_type_id")
+
+    GEN1_PARTNER_OWNER = "cf_gf3TBdO9xqr3LB9SP6XJMX7u5GbRFgknoIPGo0mVF2B"
+    GEN1_PARTNER_CONTACT = "cf_kPxEAcMd27hQCKk4RBXSIwfuav4QyPrpzGcwX04Lvlp"
+    GEN1_BROKER = "cf_Xi0eO5V1VWXDHdLNvwcn7oFHSBtdKBuHbA5UYalIrgW"
+    GEN1_TYPE = "cf_CqnuZdXRLGdEBfoNojmtNh3GkGSxmFLrykItNz4F7Eq"
+    GEN1_COMPANY = "cf_E9gIFnO0ybTo1VgNjmIghOmAPnaLIeuc4gQEueY7LVm"
+    GEN1_COMPANY_NUMBER = "cf_Fh7nPBkHbs0PLXRKxgpsNWnxoofflKYdLtzzcqy3pUJ"
+    GEN1_CONTACT_NAME = "cf_WmVlnmCidqZGKmed44H5sloPxcUGVqVVwgI4Qg0yF7z"
+    GEN1_CONTACT_PHONE = "cf_4kH5ScazObc7Phz5Fuqdsc2MuW9W3Lsmbufhn39fmbK"
+    GEN1_CONTACT_EMAIL = "cf_4K6Xv4zg50JQxyRQMRcL2MiolAkszKQqW5XiYoSCzay"
+    GEN1_FB_FBX = "cf_Y6OET4Q82lVHDrPblXhJHA2Ojaz7Mvl57kV8sCM9fHP"
+    GEN1_NOTES = "cf_TQbqzxpfF6RsGWqxK6z9cQFWpMD4ZssEWK99Q8YjUQh"
+
+    API_PARTNER_OWNER = "cf_uu8Zvx863K7mxRgKRFZh9o4ORAbzTBAYOpzHSgXJGIl"
+    API_PARTNER = "cf_0gmxLCFokmWcEfaq5yQbK7AwJAjkI4MZ1rLkLG8wu1c"
+    API_TYPE = "cf_xOmyo63cf4EslqGvyScZGnSC7axiT0fBfmIjbxBClya"
+    API_NOTES = "cf_PjpQQJQCpdq9mOYKynKuUHp7knWSl8miqehVpd1Sbdn"
+    API_ORIGINAL_FORM = "cf_ryELA04EaodpIf5nFTL0AQSfzRmw3EBK8wC0lC6z8YP"
+
+    def has_field(field_id: str) -> bool:
+        return _get_custom_field(custom, field_id) is not None
+
+    def read(field_id: str) -> Any:
+        return _read_activity_custom(custom, field_id, user_names)
+
+    def first_set(*values: Any) -> Any:
+        for value in values:
+            if value is not None and value != "":
+                return value
         return None
-    
+
+    is_gen1 = activity_type == "actitype_1CKUCsigQLAPoNmDABmjcj"
+    is_api = activity_type == "actitype_0PpighCxVchK68dd8Hknzd"
+
+    partner_owner = first_set(
+        read(GEN1_PARTNER_OWNER) if is_gen1 or has_field(GEN1_PARTNER_OWNER) else None,
+        read(API_PARTNER_OWNER) if is_api or has_field(API_PARTNER_OWNER) else None,
+    )
+    company_name = first_set(
+        read(GEN1_COMPANY) if is_gen1 or has_field(GEN1_COMPANY) else None,
+        read(API_PARTNER) if is_api or has_field(API_PARTNER) else None,
+    )
+    type_of_partner = first_set(
+        read(GEN1_TYPE) if is_gen1 or has_field(GEN1_TYPE) else None,
+        read(API_TYPE) if is_api or has_field(API_TYPE) else None,
+    )
+    notes = first_set(
+        read(GEN1_NOTES) if is_gen1 or has_field(GEN1_NOTES) else None,
+        read(API_NOTES) if is_api or has_field(API_NOTES) else None,
+    )
+    contact_phone = read(GEN1_CONTACT_PHONE) if (
+        is_gen1 or has_field(GEN1_CONTACT_PHONE)
+    ) else None
+    contact_email = read(GEN1_CONTACT_EMAIL) if (
+        is_gen1 or has_field(GEN1_CONTACT_EMAIL)
+    ) else None
+    contact_name = first_set(
+        read(GEN1_CONTACT_NAME) if is_gen1 or has_field(GEN1_CONTACT_NAME) else None,
+        read(GEN1_PARTNER_CONTACT) if is_gen1 or has_field(GEN1_PARTNER_CONTACT) else None,
+    )
+
+    lead_owner = (
+        activity.get("user_name")
+        or activity.get("created_by_name")
+        or partner_owner
+    )
+
     return {
         "custom_activity_uuid": custom_activity_uuid,
         "custom_activity_id": activity.get("id"),
-        "lead_owner": get_field("lead_owner"),
-        "company_name": get_field("company_name"),
-        "contact_number": get_field("contact_number"),
-        "contact_email_address": get_field("contact_email_address"),
-        "contact_name": get_field("contact_name"),
-        "additional_notes": get_field("additional_notes"),
-        "partner_owner": get_field("partner_owner"),
-        "broker_to_send_to": get_field("broker_to_send_to"),
-        "type_of_partner": get_field("type_of_partner"),
-        "company_number": get_field("company_number"),
-        "contact_phone_number": get_field("contact_phone_number"),
-        "fb_fbx": get_field("fb_fbx"),
-        "notes": get_field("notes"),
+        "lead_owner": lead_owner,
+        "company_name": company_name,
+        "contact_number": contact_phone,
+        "contact_email_address": contact_email,
+        "contact_name": contact_name,
+        "additional_notes": read(API_ORIGINAL_FORM) if (
+            is_api or has_field(API_ORIGINAL_FORM)
+        ) else None,
+        "partner_owner": partner_owner,
+        "broker_to_send_to": read(GEN1_BROKER) if (
+            is_gen1 or has_field(GEN1_BROKER)
+        ) else None,
+        "type_of_partner": type_of_partner,
+        "company_number": read(GEN1_COMPANY_NUMBER) if (
+            is_gen1 or has_field(GEN1_COMPANY_NUMBER)
+        ) else None,
+        "contact_phone_number": contact_phone,
+        "fb_fbx": read(GEN1_FB_FBX) if is_gen1 or has_field(GEN1_FB_FBX) else None,
+        "notes": notes,
         "updated_at": datetime.utcnow().isoformat(),
     }
 
 
-def map_partner_upload(activity: dict, custom_activity_uuid: str) -> dict:
+def map_partner_upload(
+    activity: dict,
+    custom_activity_uuid: str,
+    user_names: Optional[dict[str, str]] = None,
+) -> dict:
     """
     Map a partner upload activity to the partner_upload table.
-    
-    Handles: GEN2. New Partner Upload (actitype_5rvWuLY9CJ1bPIAYUU8wCS)
-    
-    Args:
-        activity: Raw activity data from Close API
-        custom_activity_uuid: UUID from custom_activities table
-        
-    Returns:
-        Dict ready for upsert to partner_upload
+
+    GEN2. New Partner Upload (actitype_5rvWuLY9CJ1bPIAYUU8wCS)
     """
     custom = activity.get("custom", {}) or {}
-    
-    # Field ID mappings for GEN2. New Partner Upload
-    fields = {
-        "lead_owner": "cf_BCWS1FSqD1wOxhSCWnGnu8r6qutgSItA6Tvs2N50OzS",
-        "company_name": "cf_LA6Bq4P762ZPSIiu2YGOtk0tnYPegrJHzlZSj8Aycvx",
-        "contact_number": "cf_87fWr1GfDHvkIrwhSnohzjKNCovOhpFw9P3UhzresFR",
-        "contact_email_address": "cf_wWeeTZeE8wSgJL7O9vctDrA3kMq2kWbptxtVgAnqx8a",
-        "contact_name": "cf_t5v6hQj4Jz4KzoMZY2dcXBzpXzms8KyvwTq0S5gOopq",
-        "additional_notes": "cf_idsVe9yIYNdfY6akz02nzoWtOllyLTYg0GlkQveVtF8",
-    }
-    
+
+    # GEN2. New Partner Upload — field ids from Close activity type schema
+    GEN2_LEAD_OWNER = "cf_BCWS1FSqD1wOxhSCWnGnu8r6qutgSItA6Tvs2N50OzS"
+    GEN2_COMPANY_NAME = "cf_LA6Bq4P762ZPSIiu2YGOtk0tnYPegrJHzlZSj8Aycvx"
+    GEN2_CONTACT_NUMBER = "cf_87fWr1GfDHvkIrwhSnohzjKNCovOhpFw9P3UhzresFR"
+    GEN2_CONTACT_EMAIL = "cf_wWeeTZeE8wSgJL7O9vctDrA3kMq2kWbptxtVgAnqx8a"
+    GEN2_CONTACT_NAME = "cf_t5v6hQj4Jz4KzoMZY2dcXBzpXzms8KyvwTq0S5gOopq"
+    GEN2_ADDITIONAL_NOTES = "cf_idsVe9yIYNdfY6akz02nzoWtOllyLTYg0GlkQveVtF8"
+
+    lead_owner = _read_activity_custom(custom, GEN2_LEAD_OWNER, user_names)
+    if not lead_owner:
+        lead_owner = activity.get("user_name") or activity.get("created_by_name")
+
     return {
         "custom_activity_uuid": custom_activity_uuid,
         "custom_activity_id": activity.get("id"),
-        "lead_owner": custom.get(fields["lead_owner"]),
-        "company_name": custom.get(fields["company_name"]),
-        "contact_number": custom.get(fields["contact_number"]),
-        "contact_email_address": custom.get(fields["contact_email_address"]),
-        "contact_name": custom.get(fields["contact_name"]),
-        "additional_notes": custom.get(fields["additional_notes"]),
+        "lead_owner": lead_owner,
+        "company_name": _read_activity_custom(custom, GEN2_COMPANY_NAME, user_names),
+        "contact_number": _read_activity_custom(custom, GEN2_CONTACT_NUMBER, user_names),
+        "contact_email_address": _read_activity_custom(
+            custom, GEN2_CONTACT_EMAIL, user_names
+        ),
+        "contact_name": _read_activity_custom(custom, GEN2_CONTACT_NAME, user_names),
+        "additional_notes": _read_activity_custom(
+            custom, GEN2_ADDITIONAL_NOTES, user_names
+        ),
         "updated_at": datetime.utcnow().isoformat(),
     }
 
