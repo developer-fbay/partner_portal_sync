@@ -143,6 +143,9 @@ Add:
 # Full re-sync daily at 6:00 AM UTC
 0 6 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --mode full >> /var/log/close-sync.log 2>&1
 
+# Lead details enrichment daily at midnight UTC (full Close fetch per changed lead)
+0 0 * * * docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase lead_details >> /var/log/close-sync.log 2>&1
+
 # Partner activate/deactivate weekly (Mondays 7:00 AM UTC)
 0 7 * * 1 docker run --rm --env-file /opt/close-sync-worker/.env close-sync-worker --phase partners >> /var/log/close-sync.log 2>&1
 ```
